@@ -9,6 +9,7 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { handleTodo } from "./todo.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -32,6 +33,7 @@ const {
   FEISHU_WIKI_SPACE_ID, // 知识库 space_id（整本知识库一起读，含子页面）
   FEISHU_DOC_TOKENS, // 或单独几篇云文档 document_id，逗号分隔
   DOC_REFRESH_SECONDS = "300", // 多久去飞书拉一次最新内容（秒）
+  BOT_NAME = "新手指引", // 机器人自己的名字，用来在 @ 列表里把自己排除掉
 } = process.env;
 
 const MODE = RELAY_URL && RELAY_KEY ? "relay" : ANTHROPIC_KEY ? "claude" : "qwen";
@@ -273,6 +275,26 @@ async function reply(chatId, text) {
   });
 }
 
+// 把 open_id 解析成姓名（给日报/派单显示用）。需应用开 contact:user.base:readonly；
+// 没开就降级成空名（派单的被指派人姓名走 @ 列表，不受影响）。带缓存。
+const nameCache = new Map();
+async function getUserName(openId) {
+  if (!openId) return "";
+  if (nameCache.has(openId)) return nameCache.get(openId);
+  let name = "";
+  try {
+    const r = await client.contact.user.get({
+      path: { user_id: openId },
+      params: { user_id_type: "open_id" },
+    });
+    name = r?.data?.user?.name || "";
+  } catch {
+    name = "";
+  }
+  nameCache.set(openId, name);
+  return name;
+}
+
 const seen = new Set(); // de-dupe by message_id
 function once(id) {
   if (!id || seen.has(id)) return false;
@@ -304,6 +326,25 @@ async function handleMessage(data) {
     return;
   }
   const senderId = data.sender?.sender_id?.open_id || data.sender?.sender_id?.user_id;
+
+  // —— todo / 日报 监督：命中口令就直接处理，不走问答 ——
+  try {
+    const senderName = await getUserName(senderId);
+    const todoRes = handleTodo({
+      text,
+      mentions: msg.mentions || [],
+      senderName,
+      senderOpenId: senderId,
+      botName: BOT_NAME,
+    });
+    if (todoRes && todoRes.reply) {
+      await reply(msg.chat_id, todoRes.reply);
+      return;
+    }
+  } catch (e) {
+    console.error("todo error:", e);
+  }
+
   const key = ctxKey(msg.chat_id, senderId);
   try {
     const a = await answer(text, getPrior(key));
