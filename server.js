@@ -169,8 +169,30 @@ function logQA(rec) {
   } catch {}
 }
 
+// ---- 短期记忆：按「群 + 发问人」各记最近几轮，过期自动清，群里多人不串 ----
+const CTX_TURNS = Math.max(0, Number(process.env.CTX_TURNS ?? 4)); // 记几轮（一问一答算一轮）
+const CTX_TTL_MS = Math.max(60, Number(process.env.CTX_TTL_SECONDS ?? 900)) * 1000; // 多久没说话就清空
+const history = new Map(); // key: `${chatId}:${senderId}` -> [{ q, a, ts }]
+const ctxKey = (chatId, senderId) => `${chatId}:${senderId || "anon"}`;
+function getPrior(key) {
+  const arr = history.get(key);
+  if (!arr) return [];
+  const now = Date.now();
+  const fresh = arr.filter((t) => now - t.ts <= CTX_TTL_MS);
+  if (fresh.length) history.set(key, fresh);
+  else history.delete(key);
+  return fresh.slice(-CTX_TURNS);
+}
+function pushTurn(key, q, a) {
+  if (CTX_TURNS === 0) return;
+  const arr = getPrior(key).slice();
+  arr.push({ q, a, ts: Date.now() });
+  history.set(key, arr.slice(-CTX_TURNS));
+  if (history.size > 5000) history.delete(history.keys().next().value); // 粗暴上限，防内存涨
+}
+
 // ---- the brain: answer grounded in the knowledge base ----
-async function answer(question) {
+async function answer(question, prior = []) {
   const system = [
     "你是 KOL 商务团队的入职/答疑助理机器人。",
     "只根据下面【团队知识库】回答新人的问题（付款 SOP、合同修改 SOP、合同助手工具用法、入职流程）。",
@@ -179,6 +201,12 @@ async function answer(question) {
     "【团队知识库】",
     knowledgeText(),
   ].join("\n");
+  // 把最近几轮对话当上下文（user/assistant 交替），让追问接得住
+  const priorMsgs = [];
+  for (const t of prior) {
+    if (t.q) priorMsgs.push({ role: "user", content: t.q });
+    if (t.a) priorMsgs.push({ role: "assistant", content: t.a });
+  }
   // (1) OpenAI-compatible relay (中转) — most common in China for Claude
   if (MODE === "relay") {
     const res = await fetch(RELAY_URL, {
@@ -189,6 +217,7 @@ async function answer(question) {
         max_tokens: 900,
         messages: [
           { role: "system", content: system },
+          ...priorMsgs,
           { role: "user", content: question },
         ],
       }),
@@ -211,7 +240,7 @@ async function answer(question) {
         model: ANTHROPIC_MODEL,
         max_tokens: 900,
         system,
-        messages: [{ role: "user", content: question }],
+        messages: [...priorMsgs, { role: "user", content: question }],
       }),
     });
     if (!res.ok) throw new Error(`Claude ${res.status}: ${(await res.text()).slice(0, 200)}`);
@@ -227,6 +256,7 @@ async function answer(question) {
       max_tokens: 900,
       messages: [
         { role: "system", content: system },
+        ...priorMsgs,
         { role: "user", content: question },
       ],
     }),
@@ -273,9 +303,12 @@ async function handleMessage(data) {
     await reply(msg.chat_id, HANDOFF_HINT);
     return;
   }
+  const senderId = data.sender?.sender_id?.open_id || data.sender?.sender_id?.user_id;
+  const key = ctxKey(msg.chat_id, senderId);
   try {
-    const a = await answer(text);
+    const a = await answer(text, getPrior(key));
     await reply(msg.chat_id, a || HANDOFF_HINT);
+    pushTurn(key, text, a);
     logQA({ ts: Date.now(), chat_type: msg.chat_type, q: text, a });
   } catch (e) {
     console.error("answer error:", e);
