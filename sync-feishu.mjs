@@ -32,9 +32,13 @@ async function extractOne(browser, url) {
   const page = await browser.newPage();
   try {
     await page.goto(url, { waitUntil: "networkidle", timeout: 60_000 });
-    await page.waitForTimeout(2500); // 等富文本渲染完
-    const text = await page.evaluate(() => {
-      // 飞书文档正文容器在不同版本类名不同；命中就用，否则兜底整页可见文字。
+    await page.waitForTimeout(2500); // 等富文本首屏渲染
+
+    // 飞书长文档/多维表格是「懒加载」的：只渲染当前可视区域，往下的内容要滚动才出来。
+    // 只抓首屏会丢掉文档下半部分（比如「五、下载合同」那些细节）。
+    // 所以这里一边滚动一边累积可见文字，把整篇抓全（虚拟滚动会换掉 DOM，按行去重）。
+    const text = await page.evaluate(async () => {
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       const sels = [
         ".bear-web-x-container",
         ".docx-page-block-children",
@@ -42,14 +46,63 @@ async function extractOne(browser, url) {
         ".doc-render",
         "#mainContent",
       ];
-      for (const s of sels) {
-        const el = document.querySelector(s);
-        if (el && el.innerText.trim().length > 50) return el.innerText;
+      const pickEl = () => {
+        for (const s of sels) {
+          const el = document.querySelector(s);
+          if (el && el.innerText.trim().length > 50) return el;
+        }
+        return document.body;
+      };
+      // 找到真正可滚动的容器（飞书正文常在内层 div 里滚，而非 window）
+      const pickScroller = () => {
+        const all = Array.from(document.querySelectorAll("div")).filter(
+          (el) => el.scrollHeight > el.clientHeight + 200
+        );
+        return (
+          all.sort((a, b) => b.scrollHeight - a.scrollHeight)[0] ||
+          document.scrollingElement ||
+          document.body
+        );
+      };
+      const scroller = pickScroller();
+      const seen = new Set();
+      const lines = [];
+      const grab = () => {
+        const t = pickEl().innerText || "";
+        for (const ln of t.split("\n")) {
+          const k = ln.trim();
+          if (k && !seen.has(k)) {
+            seen.add(k);
+            lines.push(ln);
+          }
+        }
+      };
+      scroller.scrollTop = 0;
+      await sleep(400);
+      grab();
+      let lastTop = -1;
+      let stable = 0;
+      for (let i = 0; i < 80; i++) {
+        scroller.scrollBy(0, Math.max(200, scroller.clientHeight * 0.8));
+        window.scrollBy(0, 600);
+        await sleep(450);
+        grab();
+        const reachedBottom =
+          scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 5;
+        if (scroller.scrollTop === lastTop) {
+          if (++stable >= 3) break; // 滚不动了（到底或不可滚）
+        } else {
+          stable = 0;
+          lastTop = scroller.scrollTop;
+        }
+        if (reachedBottom) break;
       }
-      return document.body.innerText;
+      return lines.join("\n");
     });
+
     const title = (await page.title()) || url;
-    return `# ${title}\n${(text || "").trim()}`;
+    // 带上来源链接，机器人回答时可以把原文链接甩给新人
+    return `# ${title}\n来源链接：${url}\n\n${(text || "").trim()}`;
   } finally {
     await page.close();
   }
