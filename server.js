@@ -34,7 +34,9 @@ const {
   FEISHU_DOC_TOKENS, // 或单独几篇云文档 document_id，逗号分隔
   DOC_REFRESH_SECONDS = "300", // 多久去飞书拉一次最新内容（秒）
   BOT_NAME = "新手指引", // 机器人自己的名字，用来在 @ 列表里把自己排除掉
+  TL_NAMES = "", // TL/负责人名单（逗号分隔，和飞书显示名一致）；对他们不会再说"找 TL"
 } = process.env;
+const TL_LIST = TL_NAMES.split(",").map((s) => s.trim()).filter(Boolean);
 
 const MODE = RELAY_URL && RELAY_KEY ? "relay" : ANTHROPIC_KEY ? "claude" : "qwen";
 if (!FEISHU_APP_ID || !FEISHU_APP_SECRET || (!QWEN_KEY && MODE === "qwen")) {
@@ -194,15 +196,22 @@ function pushTurn(key, q, a) {
 }
 
 // ---- the brain: answer grounded in the knowledge base ----
-async function answer(question, prior = []) {
+async function answer(question, prior = [], asker = "") {
+  const isTL = asker && TL_LIST.includes(asker);
   const system = [
     "你是 KOL 商务团队的入职/答疑助理机器人。",
+    asker ? `【当前提问人】${asker}${isTL ? "（本人就是 TL / 团队负责人）" : "（新人/实习生）"}` : "",
     "只根据下面【团队知识库】回答新人的问题（付款 SOP、合同修改 SOP、合同助手工具用法、入职流程）。",
-    "规则：1) 答案简短、可执行、分点，用中文；2) 知识库没覆盖的，明确说『这个我不确定，建议找 TL 确认』，绝不编造；3) 涉及金额/币种/合规/能不能改条款，提醒以 TL 最终确认为准；4) 凡答案用到了某篇文档的内容，必须在末尾原样给出该文档的完整链接（即知识库里那篇文档开头『来源链接：』后面的网址，直接贴出完整 URL），不要只说文档名字；该文档若没有『来源链接』就不用给链接。",
+    "规则：1) 答案简短、可执行、分点，用中文；2) 知识库没覆盖的，明确说『这个我不确定』，绝不编造；3) 涉及金额/币种/合规/能不能改条款要谨慎，以 TL 最终确认为准；4) 凡答案用到了某篇文档的内容，必须在末尾原样给出该文档的完整链接（即知识库里那篇文档开头『来源链接：』后面的网址，直接贴出完整 URL），不要只说文档名字；该文档若没有『来源链接』就不用给链接。",
+    isTL
+      ? "【重要】当前提问人本人就是 TL / 团队负责人：绝对不要让他『去找 TL 确认』；拿不准就直接说不确定、由他自己拍板。"
+      : "知识库没覆盖或拿不准时，提醒他『建议找 TL 确认』。",
     "",
     "【团队知识库】",
     knowledgeText(),
-  ].join("\n");
+  ]
+    .filter(Boolean)
+    .join("\n");
   // 把最近几轮对话当上下文（user/assistant 交替），让追问接得住
   const priorMsgs = [];
   for (const t of prior) {
@@ -326,10 +335,13 @@ async function handleMessage(data) {
     return;
   }
   const senderId = data.sender?.sender_id?.open_id || data.sender?.sender_id?.user_id;
+  let senderName = "";
+  try {
+    senderName = await getUserName(senderId);
+  } catch {}
 
   // —— todo / 日报 监督：命中口令就直接处理，不走问答 ——
   try {
-    const senderName = await getUserName(senderId);
     const todoRes = handleTodo({
       text,
       mentions: msg.mentions || [],
@@ -347,7 +359,7 @@ async function handleMessage(data) {
 
   const key = ctxKey(msg.chat_id, senderId);
   try {
-    const a = await answer(text, getPrior(key));
+    const a = await answer(text, getPrior(key), senderName);
     await reply(msg.chat_id, a || HANDOFF_HINT);
     pushTurn(key, text, a);
     logQA({ ts: Date.now(), chat_type: msg.chat_type, q: text, a });
