@@ -1,0 +1,16 @@
+{
+  "name": "roockie-lobby",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "飞书带教/答疑机器人（长连接）：群里 @它或私聊，按飞书文档 + knowledge.md 回答新人问题",
+  "scripts": {
+    "start": "node server.js",
+    "sync": "node sync-feishu.mjs"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.68.0",
+    "dotenv": "^16.4.5",
+    "playwright": "^1.48.0"
+  }
+}
