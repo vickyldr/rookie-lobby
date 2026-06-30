@@ -22,10 +22,26 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const OUT = path.join(__dirname, "knowledge.feishu.md");
-const URLS = (process.env.PUBLIC_DOC_URLS || "")
-  .split(/[\n,]+/)
-  .map((s) => s.trim())
-  .filter(Boolean);
+// 文档清单：可以写在 .env 的 PUBLIC_DOC_URLS，也可以放一个 docs.txt（每行一个链接，# 开头是注释）。
+// 想加新文档/会议纪要，直接编辑 docs.txt 即可，不用碰 .env。两处会合并去重。
+function readDocsFile() {
+  try {
+    return fs
+      .readFileSync(path.join(__dirname, "docs.txt"), "utf8")
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter((l) => l && !l.startsWith("#"));
+  } catch {
+    return [];
+  }
+}
+const URLS = [
+  ...new Set(
+    [...(process.env.PUBLIC_DOC_URLS || "").split(/[\n,]+/), ...readDocsFile()]
+      .map((s) => s.trim())
+      .filter(Boolean)
+  ),
+];
 const EVERY = Math.max(60, Number(process.env.DOC_REFRESH_SECONDS) || 300) * 1000;
 // 把「索引页/多维表格」里链接到的飞书文档也一并抓下来（往下一层）。设 FOLLOW_LINKS=0 关闭。
 const FOLLOW_LINKS = (process.env.FOLLOW_LINKS ?? "1") !== "0";

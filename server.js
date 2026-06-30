@@ -47,8 +47,10 @@ const wsClient = new Lark.WSClient({ appId: FEISHU_APP_ID, appSecret: FEISHU_APP
 // ---- knowledge base (hot-reloaded so edits take effect without restart) ----
 // KNOWLEDGE     = knowledge.md（手写：工具用法、入职流程等固定内容）
 // SYNCED        = knowledge.feishu.md（由 sync-feishu.mjs 抓「公开飞书文档」写入）
+// LEARNED       = knowledge.learned.md（自学习：digest.mjs 生成草稿、你 approve 后入库）
 let KNOWLEDGE = "";
 let SYNCED = "";
+let LEARNED = "";
 function loadKnowledge() {
   try {
     KNOWLEDGE = fs.readFileSync(path.join(__dirname, "knowledge.md"), "utf8");
@@ -59,6 +61,11 @@ function loadKnowledge() {
     SYNCED = fs.readFileSync(path.join(__dirname, "knowledge.feishu.md"), "utf8");
   } catch {
     SYNCED = "";
+  }
+  try {
+    LEARNED = fs.readFileSync(path.join(__dirname, "knowledge.learned.md"), "utf8");
+  } catch {
+    LEARNED = "";
   }
 }
 loadKnowledge();
@@ -149,9 +156,17 @@ function knowledgeText() {
     KNOWLEDGE,
     SYNCED && "===== 飞书文档（公开链接同步） =====\n" + SYNCED,
     FEISHU_DOCS && "===== 飞书文档（应用授权实时） =====\n" + FEISHU_DOCS,
+    LEARNED && "===== 沉淀知识（人工审核入库） =====\n" + LEARNED,
   ]
     .filter(Boolean)
     .join("\n\n");
+}
+
+// 把每次问答记录下来，供 digest.mjs 每天提炼成"待沉淀知识"。
+function logQA(rec) {
+  try {
+    fs.appendFileSync(path.join(__dirname, "qa-log.jsonl"), JSON.stringify(rec) + "\n");
+  } catch {}
 }
 
 // ---- the brain: answer grounded in the knowledge base ----
@@ -261,6 +276,7 @@ async function handleMessage(data) {
   try {
     const a = await answer(text);
     await reply(msg.chat_id, a || HANDOFF_HINT);
+    logQA({ ts: Date.now(), chat_type: msg.chat_type, q: text, a });
   } catch (e) {
     console.error("answer error:", e);
     await reply(msg.chat_id, "（暂时答不了，稍后再试或找 TL）" + String(e).slice(0, 120));
