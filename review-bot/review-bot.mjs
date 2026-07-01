@@ -125,9 +125,12 @@ const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(
 async function translateSegments(segments) {
   const src = segments.map((s) => `[${fmt(s.start)}-${fmt(s.end)}] ${(s.text || "").trim()}`).join("\n");
   const sys =
-    `你是红人视频字幕翻译。把下面带时间戳的原文逐条翻译成${TARGET_LANG}，` +
-    "保留每行的时间戳格式 [x:xx-x:xx]，只输出翻译结果、每条一行，不要解释、不要合并。";
-  return llmChat(sys, src);
+    `你是资深视频字幕译者。下面是一条红人视频的原文（带时间戳分段）。请翻译成自然、通顺、完整的${TARGET_LANG}：\n` +
+    "1) 保留每段开头的时间戳 [x:xx-x:xx]；\n" +
+    "2) 结合整体上下文来翻，每段要地道流畅、符合中文表达习惯，把话说完整——不要生硬直译、不要刻意精简或省略语气；\n" +
+    "3) 让整段读起来连贯自然，像人写的字幕，而不是一条条干巴巴的直译；\n" +
+    "4) 只输出带时间戳的译文，不要额外解释。";
+  return llmChat(sys, src, 2000);
 }
 async function polishFeedback(rough) {
   const sys =
