@@ -42,6 +42,18 @@ async function reply(chatId, text) {
   });
 }
 
+// 回复到"同一条消息/同一个话题"里，让同一个视频的翻译和意见都待在一个话题
+async function replyTo(messageId, text) {
+  await client.im.message.reply({
+    path: { message_id: messageId },
+    data: { msg_type: "text", content: JSON.stringify({ text }), reply_in_thread: true },
+  });
+}
+
+// 记住每个话题里"最初发视频的同学"，TL 给意见时好 @ 回他
+const threadVideoSender = new Map(); // threadKey -> { openId, ts }
+const threadKeyOf = (msg) => msg.thread_id || msg.root_id || msg.parent_id || msg.chat_id;
+
 // ---- 通用 LLM（中转，OpenAI 兼容）----
 async function llmChat(system, user, maxTokens = 1500) {
   const res = await fetch(RELAY_URL, {
@@ -140,8 +152,10 @@ async function handleMessage(data) {
   // 群里只在被 @ 时响应；私聊直接响应
   const mentioned = Array.isArray(msg.mentions) && msg.mentions.length > 0;
   if (msg.chat_type === "group" && !mentioned) return;
+  const senderOpenId = data.sender?.sender_id?.open_id;
+  const tkey = threadKeyOf(msg);
 
-  // 视频 → 转写 + 翻译
+  // 视频 → 转写 + 翻译，并记住这个话题里"发视频的同学"
   if (msg.message_type === "media" || msg.message_type === "video") {
     let content = {};
     try {
@@ -149,10 +163,11 @@ async function handleMessage(data) {
     } catch {}
     const fileKey = content.file_key || content.image_key;
     if (!fileKey) {
-      await reply(msg.chat_id, "没找到视频文件，换个方式再发一下？");
+      await replyTo(msg.message_id, "没找到视频文件，换个方式再发一下？");
       return;
     }
-    await reply(msg.chat_id, "🎬 收到视频，正在转写+翻译，请稍等（视频越长越久）…");
+    if (senderOpenId) threadVideoSender.set(tkey, { openId: senderOpenId, ts: Date.now() });
+    await replyTo(msg.message_id, "🎬 收到视频，正在转写+翻译，请稍等（视频越长越久）…");
     const vid = path.join(os.tmpdir(), msg.message_id + ".mp4");
     const aud = path.join(os.tmpdir(), msg.message_id + ".wav");
     try {
@@ -161,14 +176,14 @@ async function handleMessage(data) {
       const tr = await transcribe(aud);
       const segs = tr.segments || [];
       if (!segs.length) {
-        await reply(msg.chat_id, "这条视频没听出语音（可能是纯音乐/无人声）。");
+        await replyTo(msg.message_id, "这条视频没听出语音（可能是纯音乐/无人声）。");
         return;
       }
       const zh = await translateSegments(segs);
-      await reply(msg.chat_id, `📝 视频翻译（语言：${tr.language || "?"}）\n\n${zh}`);
+      await replyTo(msg.message_id, `📝 视频翻译（语言：${tr.language || "?"}）\n\n${zh}`);
     } catch (e) {
       console.error("video error:", e);
-      await reply(msg.chat_id, "处理视频出错了：" + String(e.message || e).slice(0, 160));
+      await replyTo(msg.message_id, "处理视频出错了：" + String(e.message || e).slice(0, 160));
     } finally {
       fs.unlink(vid, () => {});
       fs.unlink(aud, () => {});
@@ -176,7 +191,7 @@ async function handleMessage(data) {
     return;
   }
 
-  // 文字 → 把粗略意见润色成可直接发红人的话
+  // 文字 = TL 的修改意见 → 润色成可发红人的话，并在同一话题里 @ 回发视频的同学
   if (msg.message_type === "text") {
     let text = "";
     try {
@@ -185,10 +200,12 @@ async function handleMessage(data) {
     if (!text) return;
     try {
       const out = await polishFeedback(text);
-      await reply(msg.chat_id, "✍️ 可直接发给红人：\n\n" + out);
+      const target = threadVideoSender.get(tkey); // 这个话题里发视频的人
+      const at = target && target.openId ? `<at user_id="${target.openId}"></at> ` : "";
+      await replyTo(msg.message_id, `${at}✍️ 可直接发给红人：\n\n${out}`);
     } catch (e) {
       console.error("polish error:", e);
-      await reply(msg.chat_id, "润色出错了，稍后再试。");
+      await replyTo(msg.message_id, "润色出错了，稍后再试。");
     }
     return;
   }
