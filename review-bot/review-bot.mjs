@@ -164,14 +164,37 @@ async function transcribe(audioPath) {
 }
 
 const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+
+// whisper 会把语音切成 1 秒一段，逐段翻会很"机翻"。先把碎片合并成句子级大块：
+// 遇到句末标点/明显停顿/块够长就断句——翻译更连贯，行数更少，也更快。
+function mergeSegments(segments) {
+  const endsSentence = (t) => /[.!?。！？…]["'”’)\]]?\s*$/.test(t);
+  const blocks = [];
+  for (const s of segments) {
+    const text = (s.text || "").trim();
+    if (!text) continue;
+    const cur = blocks[blocks.length - 1];
+    const gap = cur ? s.start - cur.end : Infinity;
+    const tooLong = cur && (cur.text.length >= 80 || cur.end - cur.start >= 12);
+    if (!cur || endsSentence(cur.text) || tooLong || gap > 1.0) {
+      blocks.push({ start: s.start, end: s.end, text });
+    } else {
+      cur.text = `${cur.text} ${text}`.trim();
+      cur.end = s.end;
+    }
+  }
+  return blocks;
+}
+
 async function translateSegments(segments) {
-  const src = segments.map((s) => `[${fmt(s.start)}-${fmt(s.end)}] ${(s.text || "").trim()}`).join("\n");
+  const blocks = mergeSegments(segments);
+  const src = blocks.map((s) => `[${fmt(s.start)}-${fmt(s.end)}] ${s.text}`).join("\n");
   const sys =
-    `你是资深视频字幕译者。下面是一条红人视频的原文（带时间戳分段）。请翻译成自然、通顺、完整的${TARGET_LANG}：\n` +
-    "1) 保留每段开头的时间戳 [x:xx-x:xx]；\n" +
-    "2) 结合整体上下文来翻，每段要地道流畅、符合中文表达习惯，把话说完整——不要生硬直译、不要刻意精简或省略语气；\n" +
-    "3) 让整段读起来连贯自然，像人写的字幕，而不是一条条干巴巴的直译；\n" +
-    "4) 只输出带时间戳的译文，不要额外解释。";
+    `你是资深视频译者，在帮 KOL 运营审稿。下面是一条红人视频的原文（可能是德语/英语等外语，带时间戳分段）。把它翻成地道、自然、口语化的${TARGET_LANG}：\n` +
+    "1) 保留每段开头的时间戳 [x:xx-x:xx]，逐段对应输出；\n" +
+    "2) 按中文的表达习惯来译——可以调整语序、补足省略、合并短句，让它读起来像中文母语者在说话，绝不要逐字直译、不要翻译腔；\n" +
+    "3) 口语、广告词、网红用语要翻得自然接地气；\n" +
+    "4) 只输出带时间戳的译文，每段一行，不要任何额外解释。";
   return llmChat(sys, src, 2000);
 }
 async function polishFeedback(rough) {
