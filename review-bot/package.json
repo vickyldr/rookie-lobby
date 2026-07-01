@@ -1,0 +1,14 @@
+{
+  "name": "review-bot",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "审稿/翻译机器人：@它发视频给带时间戳的翻译；发粗略意见给可直接发红人的润色话",
+  "scripts": {
+    "start": "node review-bot.mjs"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.68.0",
+    "dotenv": "^16.4.5"
+  }
+}
