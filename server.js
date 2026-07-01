@@ -466,20 +466,15 @@ async function handleMessage(data) {
       );
       return;
     }
-    // 通过 [序号...]：不带序号=全入库；带序号=只留这几条，其余丢弃
-    const mm = tt.match(/^(通过|可以|入库|审核通过|approve|同意入库)\s*([\d\s,，]*)$/i);
-    if (mm) {
+    // 通过 [序号...]：不带数字=全入库；带数字=只留这几条（宽松识别，"通过1 其他不要"也认）
+    if (/^(通过|可以|入库|审核通过|approve|同意入库)/i.test(tt)) {
       const items = pendingItems();
       if (!items.length) {
         await reply(msg.chat_id, "没有待审草稿可入库。");
         return;
       }
-      const numsStr = (mm[2] || "").trim();
-      let chosen = items;
-      if (numsStr) {
-        const nums = numsStr.split(/[\s,，]+/).map(Number).filter((n) => n >= 1 && n <= items.length);
-        chosen = nums.map((n) => items[n - 1]);
-      }
+      const nums = (tt.match(/\d+/g) || []).map(Number).filter((n) => n >= 1 && n <= items.length);
+      const chosen = nums.length ? nums.map((n) => items[n - 1]) : items;
       if (!chosen.length) {
         await reply(msg.chat_id, "序号不对，没入库。发「待审」看看编号。");
         return;
