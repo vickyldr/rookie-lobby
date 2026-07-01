@@ -15,8 +15,8 @@ const LOG = path.join(__dirname, "qa-log.jsonl");
 const PENDING = path.join(__dirname, "knowledge.pending.md");
 const ADMIN_FILE = path.join(__dirname, "admin.json");
 
-// 生成草稿后，私聊通知所有已认领的管理员/TL，让他们回「待审 / 通过」审核入库。
-async function notifyAdmins(n) {
+// 生成草稿后，私聊把带编号的草稿【直接】推给管理员/TL，回「通过/通过 1 3/清空待审」即可。
+async function notifyAdmins(draft, n) {
   const { FEISHU_APP_ID, FEISHU_APP_SECRET, FEISHU_DOMAIN = "feishu" } = process.env;
   let admins = [];
   try {
@@ -28,7 +28,11 @@ async function notifyAdmins(n) {
     appSecret: FEISHU_APP_SECRET,
     domain: FEISHU_DOMAIN === "lark" ? Lark.Domain.Lark : Lark.Domain.Feishu,
   });
-  const text = `📋 今天攒了 ${n} 条对话，我提炼出了新知识草稿。\n私聊回我「待审」查看，看完回「通过」入库，或「清空待审」丢弃。`;
+  const items = draft.split(/\n\s*\n/).map((b) => b.trim()).filter(Boolean);
+  const body = items.map((it, i) => `【${i + 1}】${it}`).join("\n\n");
+  const text =
+    `📋 今天攒了 ${n} 条对话，提炼出 ${items.length} 条待沉淀知识：\n\n${body}\n\n` +
+    `——回「通过」全入库；「通过 1 3」只留这几条；「清空待审」全丢。`;
   for (const openId of admins) {
     try {
       await client.im.message.create({
@@ -112,5 +116,5 @@ fs.appendFileSync(
   `\n\n## 待审（${stamp}，覆盖最近 ${WINDOW_H}h，共 ${recs.length} 条对话）\n${draft}\n`
 );
 console.log(`已生成待审草稿 → ${PENDING}`);
-await notifyAdmins(recs.length); // 私聊通知 TL 去审核
-console.log("已私聊通知管理员（若已有人认领）。也可 node approve.mjs 直接入库。");
+await notifyAdmins(draft, recs.length); // 把草稿直接私聊推给 TL 审核
+console.log("已私聊把草稿推给管理员（若已有人认领）。也可 node approve.mjs 直接入库。");

@@ -208,13 +208,24 @@ function readPending() {
     return "";
   }
 }
-function approvePending() {
-  const p = readPending();
-  if (!p) return false;
+// 把待审草稿按空行拆成一条条（去掉 ## 标题），供编号选择入库
+function pendingItems() {
+  const raw = readPending();
+  if (!raw) return [];
+  return raw
+    .split(/\n\s*\n/)
+    .map((b) => b.trim())
+    .filter((b) => b && !b.startsWith("#"));
+}
+function appendLearned(text) {
+  if (!text) return;
   if (!fs.existsSync(LEARNED_FILE)) fs.writeFileSync(LEARNED_FILE, "# 沉淀知识（人工审核后入库）\n");
-  fs.appendFileSync(LEARNED_FILE, "\n" + p + "\n");
-  fs.writeFileSync(PENDING_FILE, "");
-  return true;
+  fs.appendFileSync(LEARNED_FILE, "\n" + text + "\n");
+}
+function clearPending() {
+  try {
+    fs.writeFileSync(PENDING_FILE, "");
+  } catch {}
 }
 
 // ---- 短期记忆：按「群 + 发问人」各记最近几轮，过期自动清，群里多人不串 ----
@@ -403,21 +414,51 @@ async function handleMessage(data) {
 
   // —— 自学习审核入库（仅 TL）——
   if (tl) {
+    // 看带编号的草稿
     if (/^(待审|看草稿|待沉淀|看待审)$/.test(tt)) {
-      const p = readPending();
+      const items = pendingItems();
       await reply(
         msg.chat_id,
-        p ? `📋 待审草稿：\n\n${p}\n\n——回「通过」入库，或「清空待审」丢弃。` : "现在没有待审草稿。"
+        items.length
+          ? "📋 待审草稿（回「通过」全入库；「通过 1 3」只留这几条；「清空待审」全丢）：\n\n" +
+              items.map((it, i) => `【${i + 1}】${it}`).join("\n\n")
+          : "现在没有待审草稿。"
       );
       return;
     }
-    if (/^(通过|可以|入库|审核通过|approve|同意入库)$/i.test(tt)) {
-      await reply(msg.chat_id, approvePending() ? "✅ 已入库，机器人 1 分钟内学会。" : "没有待审草稿可入库。");
+    // 通过 [序号...]：不带序号=全入库；带序号=只留这几条，其余丢弃
+    const mm = tt.match(/^(通过|可以|入库|审核通过|approve|同意入库)\s*([\d\s,，]*)$/i);
+    if (mm) {
+      const items = pendingItems();
+      if (!items.length) {
+        await reply(msg.chat_id, "没有待审草稿可入库。");
+        return;
+      }
+      const numsStr = (mm[2] || "").trim();
+      let chosen = items;
+      if (numsStr) {
+        const nums = numsStr.split(/[\s,，]+/).map(Number).filter((n) => n >= 1 && n <= items.length);
+        chosen = nums.map((n) => items[n - 1]);
+      }
+      if (!chosen.length) {
+        await reply(msg.chat_id, "序号不对，没入库。发「待审」看看编号。");
+        return;
+      }
+      appendLearned(chosen.join("\n\n"));
+      clearPending();
+      await reply(msg.chat_id, `✅ 已入库 ${chosen.length} 条，其余丢弃，机器人 1 分钟内学会。`);
       return;
     }
     if (/^(清空待审|丢弃草稿|删掉草稿)$/.test(tt)) {
-      fs.writeFileSync(PENDING_FILE, "");
+      clearPending();
       await reply(msg.chat_id, "🗑 已清空待审草稿。");
+      return;
+    }
+    // 手动教一条：记住：<你自己写的内容>
+    const mem = tt.match(/^(记住|学一下|记一下|加知识)[:：]\s*([\s\S]+)/);
+    if (mem && mem[2].trim()) {
+      appendLearned(mem[2].trim());
+      await reply(msg.chat_id, "✅ 记住了，已进学习库，机器人 1 分钟内用上。");
       return;
     }
   }
