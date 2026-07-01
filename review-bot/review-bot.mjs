@@ -54,6 +54,40 @@ async function replyTo(messageId, text) {
 const threadVideoSender = new Map(); // threadKey -> { openId, ts }
 const threadKeyOf = (msg) => msg.thread_id || msg.root_id || msg.parent_id || msg.chat_id;
 
+// ---- 限流保护：串行队列 + 自动重试 ----
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+class RateLimitError extends Error {}
+const isRateLimit = (e) =>
+  e instanceof RateLimitError || /\b429\b|rate.?limit|too many|频率|限流|qps/i.test(String(e?.message || e));
+const BUSY_MSG = "😥 同时使用的人太多啦，请等一分钟再 @我试一次~";
+
+// 被中转限流(429)就自动等一会儿重试；等了几轮还不行就抛出，让上层回一句友好提示。
+// 6s→12s→18s 共约 36s，配合"请等一分钟"的提示，正好覆盖一分钟的限流窗口。
+async function withRetry(fn, { tries = 3, baseMs = 6000, label = "" } = {}) {
+  let last;
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      last = e;
+      if (!isRateLimit(e) || i === tries - 1) throw e;
+      const wait = baseMs * (i + 1); // 6s, 12s, 18s
+      console.warn(`[retry] ${label} 触发限流，${wait / 1000}s 后重试 (${i + 1}/${tries})`);
+      await sleep(wait);
+    }
+  }
+  throw last;
+}
+
+// 串行队列：下载+转写+翻译这种重活一次只跑一个，天然把并发压到中转限流以内，也让排队有序。
+let _chain = Promise.resolve();
+let videoQueueLen = 0; // 还没处理完的视频条数（含正在处理的那条）
+function enqueue(task) {
+  const run = _chain.then(task, task); // 不管前一个成败都继续下一个
+  _chain = run.catch(() => {});
+  return run;
+}
+
 // ---- 通用 LLM（中转，OpenAI 兼容）----
 async function llmChat(system, user, maxTokens = 1500) {
   const res = await fetch(RELAY_URL, {
@@ -68,7 +102,11 @@ async function llmChat(system, user, maxTokens = 1500) {
       ],
     }),
   });
-  if (!res.ok) throw new Error(`中转 ${res.status}: ${(await res.text()).slice(0, 160)}`);
+  if (!res.ok) {
+    const body = (await res.text()).slice(0, 160);
+    if (res.status === 429) throw new RateLimitError(`中转限流 429: ${body}`);
+    throw new Error(`中转 ${res.status}: ${body}`);
+  }
   const j = await res.json();
   return (j.choices?.[0]?.message?.content ?? "").trim();
 }
@@ -117,7 +155,11 @@ async function transcribe(audioPath) {
     headers: { authorization: `Bearer ${RELAY_KEY}` },
     body: fd,
   });
-  if (!res.ok) throw new Error(`whisper ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  if (!res.ok) {
+    const body = (await res.text()).slice(0, 200);
+    if (res.status === 429) throw new RateLimitError(`whisper限流 429: ${body}`);
+    throw new Error(`whisper ${res.status}: ${body}`);
+  }
   return res.json(); // { text, language, segments:[{start,end,text}] }
 }
 
@@ -204,27 +246,41 @@ async function handleMessage(data) {
   // 视频 → 转写 + 翻译，并记住这个话题里"发视频的同学"
   if (fileKey) {
     if (senderOpenId) threadVideoSender.set(tkey, { openId: senderOpenId, ts: Date.now() });
-    await replyTo(msg.message_id, "🎬 收到视频，正在转写+翻译，请稍等（视频越长越久）…");
-    const vid = path.join(os.tmpdir(), msg.message_id + ".mp4");
-    const aud = path.join(os.tmpdir(), msg.message_id + ".wav");
-    try {
-      await downloadMedia(msg.message_id, fileKey, vid);
-      await extractAudio(vid, aud);
-      const tr = await transcribe(aud);
-      const segs = tr.segments || [];
-      if (!segs.length) {
-        await replyTo(msg.message_id, "这条视频没听出语音（可能是纯音乐/无人声）。");
-        return;
+    const ahead = videoQueueLen; // 前面还有几条在处理/排队
+    videoQueueLen++;
+    await replyTo(
+      msg.message_id,
+      ahead > 0
+        ? `🎬 收到视频，前面还有 ${ahead} 条在处理，排队中，请稍等…`
+        : "🎬 收到视频，正在转写+翻译，请稍等（视频越长越久）…"
+    );
+    // 进串行队列：一次只处理一条，既不会打爆中转限流，也让排队有先后
+    enqueue(async () => {
+      const vid = path.join(os.tmpdir(), msg.message_id + ".mp4");
+      const aud = path.join(os.tmpdir(), msg.message_id + ".wav");
+      try {
+        await downloadMedia(msg.message_id, fileKey, vid);
+        await extractAudio(vid, aud);
+        const tr = await withRetry(() => transcribe(aud), { label: "whisper" });
+        const segs = tr.segments || [];
+        if (!segs.length) {
+          await replyTo(msg.message_id, "这条视频没听出语音（可能是纯音乐/无人声）。");
+          return;
+        }
+        const zh = await withRetry(() => translateSegments(segs), { label: "翻译" });
+        await replyTo(msg.message_id, `📝 视频翻译（语言：${tr.language || "?"}）\n\n${zh}`);
+      } catch (e) {
+        console.error("video error:", e);
+        await replyTo(
+          msg.message_id,
+          isRateLimit(e) ? BUSY_MSG : "处理视频出错了：" + String(e.message || e).slice(0, 160)
+        );
+      } finally {
+        videoQueueLen--;
+        fs.unlink(vid, () => {});
+        fs.unlink(aud, () => {});
       }
-      const zh = await translateSegments(segs);
-      await replyTo(msg.message_id, `📝 视频翻译（语言：${tr.language || "?"}）\n\n${zh}`);
-    } catch (e) {
-      console.error("video error:", e);
-      await replyTo(msg.message_id, "处理视频出错了：" + String(e.message || e).slice(0, 160));
-    } finally {
-      fs.unlink(vid, () => {});
-      fs.unlink(aud, () => {});
-    }
+    });
     return;
   }
 
@@ -237,13 +293,13 @@ async function handleMessage(data) {
   }
   if (!text) return;
   try {
-    const out = await polishFeedback(text);
+    const out = await withRetry(() => polishFeedback(text), { label: "润色" });
     const target = threadVideoSender.get(tkey); // 这个话题里发视频的人
     const at = target && target.openId ? `<at user_id="${target.openId}"></at> ` : "";
     await replyTo(msg.message_id, `${at}✍️ 可直接发给红人：\n\n${out}`);
   } catch (e) {
     console.error("polish error:", e);
-    await replyTo(msg.message_id, "润色出错了，稍后再试。");
+    await replyTo(msg.message_id, isRateLimit(e) ? BUSY_MSG : "润色出错了，稍后再试。");
   }
 }
 
