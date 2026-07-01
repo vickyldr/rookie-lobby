@@ -35,6 +35,7 @@ const {
   DOC_REFRESH_SECONDS = "300", // 多久去飞书拉一次最新内容（秒）
   BOT_NAME = "新手指引", // 机器人自己的名字，用来在 @ 列表里把自己排除掉
   TL_NAMES = "", // TL/负责人名单（逗号分隔，和飞书显示名一致）；对他们不会再说"找 TL"
+  ADMIN_CODE = "", // 认领管理员的口令（可空）；私聊发「我是管理员 <口令>」即可
 } = process.env;
 const TL_LIST = TL_NAMES.split(",").map((s) => s.trim()).filter(Boolean);
 
@@ -173,6 +174,49 @@ function logQA(rec) {
   } catch {}
 }
 
+// —— 管理员/TL 名单（存 open_id，自助认领）：用于"不踢皮球给TL" + 私聊审核入库 ——
+const ADMIN_FILE = path.join(__dirname, "admin.json");
+function loadAdmins() {
+  try {
+    return JSON.parse(fs.readFileSync(ADMIN_FILE, "utf8"));
+  } catch {
+    return [];
+  }
+}
+function addAdmin(openId) {
+  if (!openId) return;
+  const list = loadAdmins();
+  if (!list.includes(openId)) {
+    list.push(openId);
+    try {
+      fs.writeFileSync(ADMIN_FILE, JSON.stringify(list));
+    } catch {}
+  }
+}
+// 是不是 TL：认领过（open_id）或名字在 TL_NAMES 里（需 contact 权限才有名字）
+function isTLUser(openId, name) {
+  return (openId && loadAdmins().includes(openId)) || (name && TL_LIST.includes(name));
+}
+
+// —— 自学习入库：把审核过的 knowledge.pending.md 并入 knowledge.learned.md ——
+const PENDING_FILE = path.join(__dirname, "knowledge.pending.md");
+const LEARNED_FILE = path.join(__dirname, "knowledge.learned.md");
+function readPending() {
+  try {
+    return fs.readFileSync(PENDING_FILE, "utf8").trim();
+  } catch {
+    return "";
+  }
+}
+function approvePending() {
+  const p = readPending();
+  if (!p) return false;
+  if (!fs.existsSync(LEARNED_FILE)) fs.writeFileSync(LEARNED_FILE, "# 沉淀知识（人工审核后入库）\n");
+  fs.appendFileSync(LEARNED_FILE, "\n" + p + "\n");
+  fs.writeFileSync(PENDING_FILE, "");
+  return true;
+}
+
 // ---- 短期记忆：按「群 + 发问人」各记最近几轮，过期自动清，群里多人不串 ----
 const CTX_TURNS = Math.max(0, Number(process.env.CTX_TURNS ?? 4)); // 记几轮（一问一答算一轮）
 const CTX_TTL_MS = Math.max(60, Number(process.env.CTX_TTL_SECONDS ?? 900)) * 1000; // 多久没说话就清空
@@ -196,8 +240,7 @@ function pushTurn(key, q, a) {
 }
 
 // ---- the brain: answer grounded in the knowledge base ----
-async function answer(question, prior = [], asker = "") {
-  const isTL = asker && TL_LIST.includes(asker);
+async function answer(question, prior = [], asker = "", isTL = false) {
   const system = [
     "你是 KOL 商务团队的入职/答疑助理机器人。",
     asker ? `【当前提问人】${asker}${isTL ? "（本人就是 TL / 团队负责人）" : "（新人/实习生）"}` : "",
@@ -339,6 +382,45 @@ async function handleMessage(data) {
   try {
     senderName = await getUserName(senderId);
   } catch {}
+  const tl = isTLUser(senderId, senderName);
+  if (tl) addAdmin(senderId); // 记住 TL 的 id，供每日草稿私聊推送
+  const tt = text.trim();
+
+  // —— 认领管理员：私聊发「我是管理员 <口令>」 ——
+  if (/^(我是管理员|我是tl|设我为管理员)/i.test(tt)) {
+    const code = tt.replace(/^(我是管理员|我是tl|设我为管理员)\s*/i, "").trim();
+    if (ADMIN_CODE && code !== ADMIN_CODE) {
+      await reply(msg.chat_id, "口令不对，没给你开管理员。");
+      return;
+    }
+    addAdmin(senderId);
+    await reply(
+      msg.chat_id,
+      "✅ 已把你设为管理员/TL：以后不会再让你『找 TL』；每天的新知识草稿会私聊推给你，回『待审』看、回『通过』入库、『清空待审』丢弃。"
+    );
+    return;
+  }
+
+  // —— 自学习审核入库（仅 TL）——
+  if (tl) {
+    if (/^(待审|看草稿|待沉淀|看待审)$/.test(tt)) {
+      const p = readPending();
+      await reply(
+        msg.chat_id,
+        p ? `📋 待审草稿：\n\n${p}\n\n——回「通过」入库，或「清空待审」丢弃。` : "现在没有待审草稿。"
+      );
+      return;
+    }
+    if (/^(通过|可以|入库|审核通过|approve|同意入库)$/i.test(tt)) {
+      await reply(msg.chat_id, approvePending() ? "✅ 已入库，机器人 1 分钟内学会。" : "没有待审草稿可入库。");
+      return;
+    }
+    if (/^(清空待审|丢弃草稿|删掉草稿)$/.test(tt)) {
+      fs.writeFileSync(PENDING_FILE, "");
+      await reply(msg.chat_id, "🗑 已清空待审草稿。");
+      return;
+    }
+  }
 
   // —— todo / 日报 监督：命中口令就直接处理，不走问答 ——
   try {
@@ -359,7 +441,7 @@ async function handleMessage(data) {
 
   const key = ctxKey(msg.chat_id, senderId);
   try {
-    const a = await answer(text, getPrior(key), senderName);
+    const a = await answer(text, getPrior(key), senderName, tl);
     await reply(msg.chat_id, a || HANDOFF_HINT);
     pushTurn(key, text, a);
     logQA({ ts: Date.now(), chat_type: msg.chat_type, q: text, a });

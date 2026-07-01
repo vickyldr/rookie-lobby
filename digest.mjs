@@ -5,6 +5,7 @@
 //   node digest.mjs
 //   或 pm2：pm2 start digest.mjs --name rookie-digest --cron "0 21 * * *" --no-autorestart
 import "dotenv/config";
+import * as Lark from "@larksuiteoapi/node-sdk";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,6 +13,33 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const LOG = path.join(__dirname, "qa-log.jsonl");
 const PENDING = path.join(__dirname, "knowledge.pending.md");
+const ADMIN_FILE = path.join(__dirname, "admin.json");
+
+// 生成草稿后，私聊通知所有已认领的管理员/TL，让他们回「待审 / 通过」审核入库。
+async function notifyAdmins(n) {
+  const { FEISHU_APP_ID, FEISHU_APP_SECRET, FEISHU_DOMAIN = "feishu" } = process.env;
+  let admins = [];
+  try {
+    admins = JSON.parse(fs.readFileSync(ADMIN_FILE, "utf8"));
+  } catch {}
+  if (!FEISHU_APP_ID || !FEISHU_APP_SECRET || !admins.length) return;
+  const client = new Lark.Client({
+    appId: FEISHU_APP_ID,
+    appSecret: FEISHU_APP_SECRET,
+    domain: FEISHU_DOMAIN === "lark" ? Lark.Domain.Lark : Lark.Domain.Feishu,
+  });
+  const text = `📋 今天攒了 ${n} 条对话，我提炼出了新知识草稿。\n私聊回我「待审」查看，看完回「通过」入库，或「清空待审」丢弃。`;
+  for (const openId of admins) {
+    try {
+      await client.im.message.create({
+        params: { receive_id_type: "open_id" },
+        data: { receive_id: openId, msg_type: "text", content: JSON.stringify({ text }) },
+      });
+    } catch (e) {
+      console.error("通知管理员失败", String(e).slice(0, 120));
+    }
+  }
+}
 const { RELAY_URL, RELAY_KEY, RELAY_MODEL = "claude-sonnet-4-6" } = process.env;
 const WINDOW_H = Math.max(1, Number(process.env.DIGEST_WINDOW_HOURS) || 24);
 
@@ -83,7 +111,6 @@ fs.appendFileSync(
   PENDING,
   `\n\n## 待审（${stamp}，覆盖最近 ${WINDOW_H}h，共 ${recs.length} 条对话）\n${draft}\n`
 );
-console.log(
-  `已生成待审草稿 → ${PENDING}\n` +
-    `请打开它，把不对的删掉、留下好的，然后运行：node approve.mjs 入库。`
-);
+console.log(`已生成待审草稿 → ${PENDING}`);
+await notifyAdmins(recs.length); // 私聊通知 TL 去审核
+console.log("已私聊通知管理员（若已有人认领）。也可 node approve.mjs 直接入库。");
