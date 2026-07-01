@@ -42,11 +42,11 @@ async function reply(chatId, text) {
   });
 }
 
-// 回复到"同一条消息/同一个话题"里，让同一个视频的翻译和意见都待在一个话题
+// 回复到"那条消息"上（普通引用回复）：平铺群不会硬开话题；话题群里回复也自然留在话题里
 async function replyTo(messageId, text) {
   await client.im.message.reply({
     path: { message_id: messageId },
-    data: { msg_type: "text", content: JSON.stringify({ text }), reply_in_thread: true },
+    data: { msg_type: "text", content: JSON.stringify({ text }) },
   });
 }
 
