@@ -30,7 +30,10 @@ if (!FEISHU_APP_ID || !FEISHU_APP_SECRET || !RELAY_URL || !RELAY_KEY) {
 }
 
 const OPEN_BASE = FEISHU_DOMAIN === "lark" ? "https://open.larksuite.com" : "https://open.feishu.cn";
+// 注意：Azure 的 chat/whisper 是两个独立完整 URL，请直接配 WHISPER_URL，别靠推导
 const TRANSCRIBE_URL = WHISPER_URL || RELAY_URL.replace(/\/chat\/completions.*$/, "/audio/transcriptions");
+// Azure OpenAI 用 `api-key` 请求头（不是标准 OpenAI 的 Bearer），且模型名在 URL 里而非 body
+const isAzure = (u) => /\.azure\.com/i.test(u || "");
 const domain = FEISHU_DOMAIN === "lark" ? Lark.Domain.Lark : Lark.Domain.Feishu;
 const client = new Lark.Client({ appId: FEISHU_APP_ID, appSecret: FEISHU_APP_SECRET, domain });
 const wsClient = new Lark.WSClient({ appId: FEISHU_APP_ID, appSecret: FEISHU_APP_SECRET, domain });
@@ -92,7 +95,10 @@ function enqueue(task) {
 async function llmChat(system, user, maxTokens = 1500) {
   const res = await fetch(RELAY_URL, {
     method: "POST",
-    headers: { "content-type": "application/json", authorization: `Bearer ${RELAY_KEY}` },
+    headers: {
+      "content-type": "application/json",
+      ...(isAzure(RELAY_URL) ? { "api-key": RELAY_KEY } : { authorization: `Bearer ${RELAY_KEY}` }),
+    },
     body: JSON.stringify({
       model: RELAY_MODEL,
       max_tokens: maxTokens,
@@ -147,12 +153,12 @@ function extractAudio(videoPath, audioPath) {
 // ---- whisper 转写（带时间戳）----
 async function transcribe(audioPath) {
   const fd = new FormData();
-  fd.append("model", WHISPER_MODEL);
+  if (!isAzure(TRANSCRIBE_URL)) fd.append("model", WHISPER_MODEL); // Azure 的模型在 URL 里，body 里放会报错
   fd.append("response_format", "verbose_json");
   fd.append("file", new Blob([fs.readFileSync(audioPath)]), "audio.wav");
   const res = await fetch(TRANSCRIBE_URL, {
     method: "POST",
-    headers: { authorization: `Bearer ${RELAY_KEY}` },
+    headers: isAzure(TRANSCRIBE_URL) ? { "api-key": RELAY_KEY } : { authorization: `Bearer ${RELAY_KEY}` },
     body: fd,
   });
   if (!res.ok) {
