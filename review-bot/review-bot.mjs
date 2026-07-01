@@ -149,6 +149,9 @@ const once = (id) => {
 async function handleMessage(data) {
   const msg = data?.message;
   if (!msg || !once(msg.message_id)) return;
+  console.log(
+    `[msg] type=${msg.message_type} chat=${msg.chat_type} mentions=${(msg.mentions || []).length} content=${(msg.content || "").slice(0, 120)}`
+  );
   // 群里只在被 @ 时响应；私聊直接响应
   const mentioned = Array.isArray(msg.mentions) && msg.mentions.length > 0;
   if (msg.chat_type === "group" && !mentioned) return;
