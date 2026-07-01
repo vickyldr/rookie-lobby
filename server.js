@@ -250,6 +250,46 @@ function pushTurn(key, q, a) {
   if (history.size > 5000) history.delete(history.keys().next().value); // 粗暴上限，防内存涨
 }
 
+// 一个不带知识库的通用 LLM 调用（给"按修改意见改草稿"这类内部任务用）
+async function llmChat(system, userText, maxTokens = 900) {
+  if (MODE === "relay") {
+    const res = await fetch(RELAY_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${RELAY_KEY}` },
+      body: JSON.stringify({
+        model: RELAY_MODEL,
+        max_tokens: maxTokens,
+        messages: [{ role: "system", content: system }, { role: "user", content: userText }],
+      }),
+    });
+    if (!res.ok) throw new Error(`中转 ${res.status}`);
+    const j = await res.json();
+    return (j.choices?.[0]?.message?.content ?? "").trim();
+  }
+  if (MODE === "claude") {
+    const res = await fetch(`${ANTHROPIC_BASE}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: ANTHROPIC_MODEL, max_tokens: maxTokens, system, messages: [{ role: "user", content: userText }] }),
+    });
+    if (!res.ok) throw new Error(`Claude ${res.status}`);
+    const j = await res.json();
+    return (j.content ?? []).filter((p) => p.type === "text").map((p) => p.text).join("").trim();
+  }
+  const res = await fetch(`${QWEN_BASE}/compatible-mode/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${QWEN_KEY}` },
+    body: JSON.stringify({
+      model: QWEN_MODEL,
+      max_tokens: maxTokens,
+      messages: [{ role: "system", content: system }, { role: "user", content: userText }],
+    }),
+  });
+  if (!res.ok) throw new Error(`Qwen ${res.status}`);
+  const j = await res.json();
+  return (j.choices?.[0]?.message?.content ?? "").trim();
+}
+
 // ---- the brain: answer grounded in the knowledge base ----
 async function answer(question, prior = [], asker = "", isTL = false) {
   const system = [
@@ -454,6 +494,37 @@ async function handleMessage(data) {
       await reply(msg.chat_id, "🗑 已清空待审草稿。");
       return;
     }
+    // 按修改意见改草稿再入库：改：第一点改成xxx，二三不要
+    const edit = tt.match(/^(改|修改|编辑)[:：]\s*([\s\S]+)/);
+    if (edit && edit[2].trim()) {
+      const items = pendingItems();
+      if (!items.length) {
+        await reply(msg.chat_id, "现在没有待审草稿可改。");
+        return;
+      }
+      const numbered = items.map((it, i) => `【${i + 1}】${it}`).join("\n\n");
+      const sys =
+        "你在帮团队维护知识库。下面是【待审知识草稿】和审核人的【修改意见】。" +
+        "请按修改意见产出【最终要入库的知识】：保留/改写审核人要的、删掉他不要的，一切以他的措辞为准。" +
+        "只输出最终知识条目本身（每条简洁，条目之间空一行），不要编号、不要解释、不要多余的话。";
+      const usr = `【待审知识草稿】\n${numbered}\n\n【修改意见】\n${edit[2].trim()}`;
+      let finalText = "";
+      try {
+        finalText = await llmChat(sys, usr);
+      } catch {
+        await reply(msg.chat_id, "改的时候出错了，稍后再试。");
+        return;
+      }
+      if (!finalText) {
+        await reply(msg.chat_id, "没生成出内容，换个说法再试。");
+        return;
+      }
+      appendLearned(finalText);
+      clearPending();
+      await reply(msg.chat_id, `✅ 已按你的修改入库：\n\n${finalText}`);
+      return;
+    }
+
     // 手动教一条：记住：<你自己写的内容>
     const mem = tt.match(/^(记住|学一下|记一下|加知识)[:：]\s*([\s\S]+)/);
     if (mem && mem[2].trim()) {
