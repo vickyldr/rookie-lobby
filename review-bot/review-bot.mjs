@@ -146,6 +146,33 @@ const once = (id) => {
   return true;
 };
 
+// 飞书常把视频当 post(富文本)发，文件藏在 content.content 里的 {tag:"media",file_key}
+function findMediaInPost(content) {
+  try {
+    for (const row of content.content || []) {
+      for (const el of row) {
+        if (el && (el.tag === "media" || el.tag === "video") && (el.file_key || el.image_key)) {
+          return el.file_key || el.image_key;
+        }
+      }
+    }
+  } catch {}
+  return null;
+}
+// 从 post 里抽纯文字（当反馈意见用）
+function textFromPost(content) {
+  const out = [];
+  try {
+    if (content.title) out.push(content.title);
+    for (const row of content.content || []) {
+      for (const el of row) {
+        if (el && (el.tag === "text" || el.tag === "a") && el.text) out.push(el.text);
+      }
+    }
+  } catch {}
+  return out.join(" ").replace(/@_user_\d+/g, " ").trim();
+}
+
 async function handleMessage(data) {
   const msg = data?.message;
   if (!msg || !once(msg.message_id)) return;
@@ -158,17 +185,21 @@ async function handleMessage(data) {
   const senderOpenId = data.sender?.sender_id?.open_id;
   const tkey = threadKeyOf(msg);
 
-  // 视频 → 转写 + 翻译，并记住这个话题里"发视频的同学"
+  let content = {};
+  try {
+    content = JSON.parse(msg.content || "{}");
+  } catch {}
+
+  // 找视频文件：直接 media/video 类型，或藏在 post 富文本里
+  let fileKey = null;
   if (msg.message_type === "media" || msg.message_type === "video") {
-    let content = {};
-    try {
-      content = JSON.parse(msg.content || "{}");
-    } catch {}
-    const fileKey = content.file_key || content.image_key;
-    if (!fileKey) {
-      await replyTo(msg.message_id, "没找到视频文件，换个方式再发一下？");
-      return;
-    }
+    fileKey = content.file_key || content.image_key;
+  } else if (msg.message_type === "post") {
+    fileKey = findMediaInPost(content);
+  }
+
+  // 视频 → 转写 + 翻译，并记住这个话题里"发视频的同学"
+  if (fileKey) {
     if (senderOpenId) threadVideoSender.set(tkey, { openId: senderOpenId, ts: Date.now() });
     await replyTo(msg.message_id, "🎬 收到视频，正在转写+翻译，请稍等（视频越长越久）…");
     const vid = path.join(os.tmpdir(), msg.message_id + ".mp4");
@@ -194,23 +225,22 @@ async function handleMessage(data) {
     return;
   }
 
-  // 文字 = TL 的修改意见 → 润色成可发红人的话，并在同一话题里 @ 回发视频的同学
+  // 文字（text 或 post 里的纯文字）= 修改意见 → 润色 + @回发视频的同学
+  let text = "";
   if (msg.message_type === "text") {
-    let text = "";
-    try {
-      text = (JSON.parse(msg.content || "{}").text || "").replace(/@_user_\d+/g, " ").trim();
-    } catch {}
-    if (!text) return;
-    try {
-      const out = await polishFeedback(text);
-      const target = threadVideoSender.get(tkey); // 这个话题里发视频的人
-      const at = target && target.openId ? `<at user_id="${target.openId}"></at> ` : "";
-      await replyTo(msg.message_id, `${at}✍️ 可直接发给红人：\n\n${out}`);
-    } catch (e) {
-      console.error("polish error:", e);
-      await replyTo(msg.message_id, "润色出错了，稍后再试。");
-    }
-    return;
+    text = (content.text || "").replace(/@_user_\d+/g, " ").trim();
+  } else if (msg.message_type === "post") {
+    text = textFromPost(content);
+  }
+  if (!text) return;
+  try {
+    const out = await polishFeedback(text);
+    const target = threadVideoSender.get(tkey); // 这个话题里发视频的人
+    const at = target && target.openId ? `<at user_id="${target.openId}"></at> ` : "";
+    await replyTo(msg.message_id, `${at}✍️ 可直接发给红人：\n\n${out}`);
+  } catch (e) {
+    console.error("polish error:", e);
+    await replyTo(msg.message_id, "润色出错了，稍后再试。");
   }
 }
 
