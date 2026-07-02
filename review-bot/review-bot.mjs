@@ -39,7 +39,7 @@ const isAzure = (u) => /\.azure\.com/i.test(u || "");
 // 按你们实际产品改这一句即可，也可以在 .env 里设 PRODUCT_INFO 覆盖。
 const PRODUCT_INFO =
   process.env.PRODUCT_INFO ||
-  "产品是 Riffmix（把照片/素材自动生成带歌音乐视频的 App）。“产品效果”指画面里展示用该 App 做出来的成品：生成好的音乐视频在播放、最终作品展示、或前后对比。";
+  "产品是一款 AI 创作 App（Riffmix，用 AI 自动生成视频、歌曲/音乐）。“产品效果”指画面里展示 AI 生成的成品——AI 做出来的视频在播放、AI 生成的歌曲/音乐、AI 特效呈现、或用 App 做出来的最终作品。";
 const domain = FEISHU_DOMAIN === "lark" ? Lark.Domain.Lark : Lark.Domain.Feishu;
 const client = new Lark.Client({ appId: FEISHU_APP_ID, appSecret: FEISHU_APP_SECRET, domain });
 const wsClient = new Lark.WSClient({ appId: FEISHU_APP_ID, appSecret: FEISHU_APP_SECRET, domain });
@@ -156,6 +156,36 @@ async function getMessage(messageId) {
   const item = j?.data?.items?.[0];
   if (!item) throw new Error(`取消息失败 ${res.status}: ` + JSON.stringify(j).slice(0, 120));
   return item; // { message_id, msg_type, body:{content}, sender:{id,id_type} }
+}
+// 列出某个话题(thread)里的消息（按时间升序），用来找话题里最近的一条视频
+async function listThreadMessages(threadId) {
+  const token = await tenantToken();
+  const url =
+    `${OPEN_BASE}/open-apis/im/v1/messages?container_id_type=thread` +
+    `&container_id=${encodeURIComponent(threadId)}&sort_type=ByCreateTimeAsc&page_size=50`;
+  const res = await fetch(url, { headers: { authorization: `Bearer ${token}` } });
+  const j = await res.json();
+  if (!res.ok) throw new Error(`列话题消息失败 ${res.status}: ` + JSON.stringify(j).slice(0, 120));
+  return j?.data?.items || [];
+}
+// 找"这次 @ 想翻译的视频"：① 被回复的那条 → ② 话题里最近的一条视频 → ③ 话题根消息
+async function findRecentVideoMessage(msg) {
+  if (msg.parent_id) {
+    const p = await getMessage(msg.parent_id).catch(() => null);
+    if (p && fileKeyFromMessage(p.msg_type, p.body?.content)) return p;
+  }
+  if (msg.thread_id) {
+    const items = await listThreadMessages(msg.thread_id).catch(() => []);
+    const vids = items.filter(
+      (m) => m.message_id !== msg.message_id && fileKeyFromMessage(m.msg_type, m.body?.content)
+    );
+    if (vids.length) return vids[vids.length - 1]; // 多轮改稿时取最近的一条视频
+  }
+  if (msg.root_id) {
+    const r = await getMessage(msg.root_id).catch(() => null);
+    if (r && fileKeyFromMessage(r.msg_type, r.body?.content)) return r;
+  }
+  return null;
 }
 
 // ---- ffmpeg 抽音频（16k 单声道 wav，whisper 最爱）----
@@ -312,7 +342,8 @@ async function reviewChecklist(zhTranscript, frames, durationSec) {
     "2) Logo：画面里有没有品牌 logo？大小是否合适（别太小看不清，也别大到喧宾夺主）？大概第几秒出现；\n" +
     "3) 标题字幕：画面里有没有标题文字？把标题原文读出来、翻成中文，再简短点评（有没有点明卖点、够不够吸引人）；若没标题就标 ⚠️ 提示加标题；\n" +
     "4) App 录屏操作：有没有 app 内操作的录屏画面？是否清晰、看得懂在操作什么（结合口播判断）；\n" +
-    "5) 产品效果展示：按标准，开头和结尾最好【各有一次】产品效果露出——分别检查开头、结尾有没有，各在大概第几秒；缺哪头就明确指出；\n" +
+    "5) 产品效果展示：按标准，开头和结尾最好【各有一次】产品效果露出——分别检查开头、结尾有没有，各在大概第几秒；缺哪头就明确指出。" +
+    "若你无法确定这个产品的『最终效果』具体长什么样，不要硬猜，直接写：『我不确定最终效果是什么，请自行判断』；\n" +
     "6) 开头/Hook：从视频开头，到『产品名 / logo / 产品效果 这三者里最早出现的那一个』为止算开头，是否太长（越短越好）？指出最早出现的是哪一样、在第几秒（效果先出现也算，不一定非要产品名）；\n" +
     "7) 口播：有没有口播、讲解是否清楚；\n" +
     "某项若从画面/口播无法判断，就写『无法判断』。\n" +
@@ -395,19 +426,18 @@ async function handleMessage(data) {
   let mediaMsgId = msg.message_id; // 视频所在消息的 id（下载资源要用它）
   let videoSenderOpenId = senderOpenId; // 默认记发 @ 的人
 
-  // 当前消息没视频、也没写意见（只是 @了一下）、但它在"回复某条消息"→ 去被回复的那条里找视频
-  // （支持"先发视频、再回复该视频并 @机器人"这种分两条的常见用法；若带了意见文字则当反馈处理，不劫持成翻译）
-  if (!fileKey && !text && msg.parent_id) {
+  // 当前消息没视频、也没写意见（只是 @了一下）→ 去"被回复的那条 / 话题里最近的视频 / 话题根"里找视频
+  // 兼容两种用法：① 回复视频再 @；② 话题里没有"回复"选项，只能视频后面另发一条 @机器人
+  if (!fileKey && !text) {
     try {
-      const parent = await getMessage(msg.parent_id);
-      const pk = fileKeyFromMessage(parent.msg_type, parent.body?.content);
-      if (pk) {
-        fileKey = pk;
-        mediaMsgId = parent.message_id || msg.parent_id;
-        if (parent.sender?.id_type === "open_id" && parent.sender?.id) videoSenderOpenId = parent.sender.id;
+      const src = await findRecentVideoMessage(msg);
+      if (src) {
+        fileKey = fileKeyFromMessage(src.msg_type, src.body?.content);
+        mediaMsgId = src.message_id;
+        if (src.sender?.id_type === "open_id" && src.sender?.id) videoSenderOpenId = src.sender.id;
       }
     } catch (e) {
-      console.error("取被回复消息失败:", String(e.message || e).slice(0, 140));
+      console.error("找话题里的视频失败:", String(e.message || e).slice(0, 140));
     }
   }
 
@@ -471,7 +501,14 @@ async function handleMessage(data) {
   }
 
   // 文字（text 或 post 里的纯文字）= 修改意见 → 润色 + @回发视频的同学
-  if (!text) return;
+  if (!text) {
+    // @了机器人，但既没视频、也没写意见、话题里也没找到视频 → 给个提示，别闷不吭声
+    await replyTo(
+      msg.message_id,
+      "没找到要翻译的视频～可以：① 把视频和 @我 发在同一条；② 回复那条视频再 @我；③ 或在同一个话题里 @我。给红人的修改意见也可以直接 @我 打出来。"
+    );
+    return;
+  }
   try {
     const out = await withRetry(() => polishFeedback(text, threadVideoLang.get(tkey)), { label: "润色" });
     const target = threadVideoSender.get(tkey); // 这个话题里发视频的人
