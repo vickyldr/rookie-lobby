@@ -52,6 +52,8 @@ const PRODUCT_INFO =
 
 // 是否开启"把修改意见润色成发给红人的话"功能。.env 里设 FEEDBACK_POLISH=off 可关掉，只保留视频翻译。
 const POLISH_ON = String(process.env.FEEDBACK_POLISH ?? "on").toLowerCase() !== "off";
+// 是否开启"AI 自动审稿清单"（翻译后再发一条清单）。.env 里设 REVIEW_CHECKLIST=off 可关掉，只发翻译。
+const CHECKLIST_ON = String(process.env.REVIEW_CHECKLIST ?? "on").toLowerCase() !== "off";
 const domain = FEISHU_DOMAIN === "lark" ? Lark.Domain.Lark : Lark.Domain.Feishu;
 const client = new Lark.Client({ appId: FEISHU_APP_ID, appSecret: FEISHU_APP_SECRET, domain });
 const wsClient = new Lark.WSClient({ appId: FEISHU_APP_ID, appSecret: FEISHU_APP_SECRET, domain });
@@ -527,16 +529,18 @@ async function handleMessage(data) {
           await replyTo(msg.message_id, "这条视频没听出语音（可能是纯音乐/无人声），仅做画面审稿。");
         }
 
-        // 第 2 条：审稿清单（看画面帧+口播，较慢；best-effort，失败也不影响上面的翻译）
-        try {
-          const dur = await videoDuration(vid).catch(() => 0);
-          const frames = await extractFrames(vid, frameDir);
-          if (frames.length) {
-            const cl = await withRetry(() => reviewChecklist(zh, frames, dur), { label: "审稿" });
-            if (cl) await replyTo(msg.message_id, `🔍 AI 自动审稿清单（⚠️ AI 生成、仅供参考，以 TL 为准）\n${cl.trim()}`);
+        // 第 2 条：审稿清单（看画面帧+口播，较慢；best-effort）。可用 .env 的 REVIEW_CHECKLIST=off 关掉
+        if (CHECKLIST_ON) {
+          try {
+            const dur = await videoDuration(vid).catch(() => 0);
+            const frames = await extractFrames(vid, frameDir);
+            if (frames.length) {
+              const cl = await withRetry(() => reviewChecklist(zh, frames, dur), { label: "审稿" });
+              if (cl) await replyTo(msg.message_id, `🔍 AI 自动审稿清单（⚠️ AI 生成、仅供参考，以 TL 为准）\n${cl.trim()}`);
+            }
+          } catch (e) {
+            console.error("checklist error:", String(e.message || e).slice(0, 140));
           }
-        } catch (e) {
-          console.error("checklist error:", String(e.message || e).slice(0, 140));
         }
       } catch (e) {
         console.error("video error:", e);
