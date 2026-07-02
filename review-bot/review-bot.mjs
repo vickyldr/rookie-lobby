@@ -138,6 +138,17 @@ async function downloadMedia(messageId, fileKey, destPath) {
   if (!res.ok) throw new Error(`下载视频失败 ${res.status}: ${(await res.text()).slice(0, 120)}`);
   fs.writeFileSync(destPath, Buffer.from(await res.arrayBuffer()));
 }
+// 拿某条消息的详情（用来读"被回复的那条"里的视频）
+async function getMessage(messageId) {
+  const token = await tenantToken();
+  const res = await fetch(`${OPEN_BASE}/open-apis/im/v1/messages/${messageId}`, {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  const j = await res.json();
+  const item = j?.data?.items?.[0];
+  if (!item) throw new Error(`取消息失败 ${res.status}: ` + JSON.stringify(j).slice(0, 120));
+  return item; // { message_id, msg_type, body:{content}, sender:{id,id_type} }
+}
 
 // ---- ffmpeg 抽音频（16k 单声道 wav，whisper 最爱）----
 function extractAudio(videoPath, audioPath) {
@@ -233,6 +244,16 @@ function findMediaInPost(content) {
   } catch {}
   return null;
 }
+// 从一条消息（media/video/post）里找视频 file_key；contentStr 是飞书的 content 字符串
+function fileKeyFromMessage(msgType, contentStr) {
+  let c = {};
+  try {
+    c = JSON.parse(contentStr || "{}");
+  } catch {}
+  if (msgType === "media" || msgType === "video") return c.file_key || c.image_key || null;
+  if (msgType === "post") return findMediaInPost(c);
+  return null;
+}
 // 从 post 里抽纯文字（当反馈意见用）
 function textFromPost(content) {
   const out = [];
@@ -264,17 +285,35 @@ async function handleMessage(data) {
     content = JSON.parse(msg.content || "{}");
   } catch {}
 
+  // 当前消息里的纯文字（去掉 @ 占位）——用来判断是"意见"还是"只是 @了一下"
+  let text = "";
+  if (msg.message_type === "text") text = (content.text || "").replace(/@_user_\d+/g, " ").trim();
+  else if (msg.message_type === "post") text = textFromPost(content);
+
   // 找视频文件：直接 media/video 类型，或藏在 post 富文本里
-  let fileKey = null;
-  if (msg.message_type === "media" || msg.message_type === "video") {
-    fileKey = content.file_key || content.image_key;
-  } else if (msg.message_type === "post") {
-    fileKey = findMediaInPost(content);
+  let fileKey = fileKeyFromMessage(msg.message_type, msg.content);
+  let mediaMsgId = msg.message_id; // 视频所在消息的 id（下载资源要用它）
+  let videoSenderOpenId = senderOpenId; // 默认记发 @ 的人
+
+  // 当前消息没视频、也没写意见（只是 @了一下）、但它在"回复某条消息"→ 去被回复的那条里找视频
+  // （支持"先发视频、再回复该视频并 @机器人"这种分两条的常见用法；若带了意见文字则当反馈处理，不劫持成翻译）
+  if (!fileKey && !text && msg.parent_id) {
+    try {
+      const parent = await getMessage(msg.parent_id);
+      const pk = fileKeyFromMessage(parent.msg_type, parent.body?.content);
+      if (pk) {
+        fileKey = pk;
+        mediaMsgId = parent.message_id || msg.parent_id;
+        if (parent.sender?.id_type === "open_id" && parent.sender?.id) videoSenderOpenId = parent.sender.id;
+      }
+    } catch (e) {
+      console.error("取被回复消息失败:", String(e.message || e).slice(0, 140));
+    }
   }
 
   // 视频 → 转写 + 翻译，并记住这个话题里"发视频的同学"
   if (fileKey) {
-    if (senderOpenId) threadVideoSender.set(tkey, { openId: senderOpenId, ts: Date.now() });
+    if (videoSenderOpenId) threadVideoSender.set(tkey, { openId: videoSenderOpenId, ts: Date.now() });
     const ahead = videoQueueLen; // 前面还有几条在处理/排队
     videoQueueLen++;
     await replyTo(
@@ -288,7 +327,7 @@ async function handleMessage(data) {
       const vid = path.join(os.tmpdir(), msg.message_id + ".mp4");
       const aud = path.join(os.tmpdir(), msg.message_id + ".wav");
       try {
-        await downloadMedia(msg.message_id, fileKey, vid);
+        await downloadMedia(mediaMsgId, fileKey, vid);
         await extractAudio(vid, aud);
         const tr = await withRetry(() => transcribe(aud), { label: "whisper" });
         const segs = tr.segments || [];
@@ -314,12 +353,6 @@ async function handleMessage(data) {
   }
 
   // 文字（text 或 post 里的纯文字）= 修改意见 → 润色 + @回发视频的同学
-  let text = "";
-  if (msg.message_type === "text") {
-    text = (content.text || "").replace(/@_user_\d+/g, " ").trim();
-  } else if (msg.message_type === "post") {
-    text = textFromPost(content);
-  }
   if (!text) return;
   try {
     const out = await withRetry(() => polishFeedback(text), { label: "润色" });
