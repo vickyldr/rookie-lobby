@@ -77,6 +77,8 @@ async function replyTo(messageId, text) {
 const threadVideoSender = new Map(); // threadKey -> { openId, ts }
 // 记住每个话题里视频的语言（whisper 识别的），润色反馈时用红人的语言输出
 const threadVideoLang = new Map(); // threadKey -> language string，如 "german"/"spanish"
+// 「先 @机器人、后发视频」的等待：threadKey -> { sender, expiresAt }，90 秒内同一个人发的视频自动认下
+const pendingAt = new Map();
 const threadKeyOf = (msg) => msg.thread_id || msg.root_id || msg.parent_id || msg.chat_id;
 
 // ---- 限流保护：串行队列 + 自动重试 ----
@@ -471,15 +473,6 @@ async function handleMessage(data) {
     `[msg] type=${msg.message_type} chat=${msg.chat_type} mentions=${(msg.mentions || []).length}` +
       ` thread=${msg.thread_id || "-"} root=${msg.root_id || "-"} parent=${msg.parent_id || "-"} content=${(msg.content || "").slice(0, 80)}`
   );
-  // 群里【只在 @了机器人本人】时响应（不是 @了任意人就响应）；私聊直接响应
-  const botId = _botOpenId; // 启动时已取到
-  const mentionsBot =
-    Array.isArray(msg.mentions) &&
-    msg.mentions.some((m) => {
-      const oid = m?.id?.open_id || (typeof m?.id === "string" ? m.id : "");
-      return botId ? oid === botId : true; // 万一没取到 botId，退回"有@就算"，避免完全不响应
-    });
-  if (msg.chat_type === "group" && !mentionsBot) return;
   const senderOpenId = data.sender?.sender_id?.open_id;
   const tkey = threadKeyOf(msg);
 
@@ -493,14 +486,32 @@ async function handleMessage(data) {
   if (msg.message_type === "text") text = (content.text || "").replace(/@_user_\d+/g, " ").trim();
   else if (msg.message_type === "post") text = textFromPost(content);
 
-  // 找视频文件：直接 media/video 类型，或藏在 post 富文本里
-  let fileKey = fileKeyFromMessage(msg.message_type, msg.content);
+  // 这条消息自带的视频
+  const selfFileKey = fileKeyFromMessage(msg.message_type, msg.content);
+
+  // 是否 @了机器人本人（不是 @了任意人）
+  const botId = _botOpenId; // 启动时已取到
+  const mentionsBot =
+    Array.isArray(msg.mentions) &&
+    msg.mentions.some((m) => {
+      const oid = m?.id?.open_id || (typeof m?.id === "string" ? m.id : "");
+      return botId ? oid === botId : true; // 万一没取到 botId，退回"有@就算"，避免完全不响应
+    });
+
+  // 「先 @、后发视频」：这条是视频、没 @机器人，但这个话题刚有同一个人 @机器人在等视频（90 秒内）→ 认下它
+  const pend = pendingAt.get(tkey);
+  const pendHit =
+    !!selfFileKey && !mentionsBot && pend && Date.now() < pend.expiresAt && pend.sender === senderOpenId;
+
+  // 群里：既没 @机器人、也不是"在等的那条视频" → 忽略；私聊直接处理
+  if (msg.chat_type === "group" && !mentionsBot && !pendHit) return;
+  if (pendHit) pendingAt.delete(tkey); // 认下了，清掉等待
+
+  // 找视频：先看这条自带的；@了机器人但这条没视频没意见 → 往回找（回复/话题/群里最近的视频）
+  let fileKey = selfFileKey;
   let mediaMsgId = msg.message_id; // 视频所在消息的 id（下载资源要用它）
   let videoSenderOpenId = senderOpenId; // 默认记发 @ 的人
-
-  // 当前消息没视频、也没写意见（只是 @了一下）→ 去"被回复的那条 / 话题里最近的视频 / 话题根"里找视频
-  // 兼容两种用法：① 回复视频再 @；② 话题里没有"回复"选项，只能视频后面另发一条 @机器人
-  if (!fileKey && !text) {
+  if (!fileKey && !text && mentionsBot) {
     try {
       const src = await findRecentVideoMessage(msg);
       if (src) {
@@ -574,22 +585,17 @@ async function handleMessage(data) {
     return;
   }
 
-  // 反馈润色（可用 .env 的 FEEDBACK_POLISH=off 关掉；关掉后只做视频翻译）
-  if (!POLISH_ON) {
-    if (!text)
-      await replyTo(msg.message_id, "没找到要翻译的视频～把视频和 @我 发在同一条，或在同一个话题里 @我。");
-    return; // 已关闭反馈润色：即使写了意见也不处理
-  }
-
-  // 文字（text 或 post 里的纯文字）= 修改意见 → 润色 + @回发视频的同学
+  // 到这里 = 没有视频可翻。
+  // 纯 @（没视频、没意见）→ 登记"等视频"：接下来 90 秒内同一个人发的视频自动认下（支持"先 @ 后发视频"）
   if (!text) {
-    // @了机器人，但既没视频、也没写意见、话题里也没找到视频 → 给个提示，别闷不吭声
-    await replyTo(
-      msg.message_id,
-      "没找到要翻译的视频～可以：① 把视频和 @我 发在同一条；② 回复那条视频再 @我；③ 或在同一个话题里 @我。给红人的修改意见也可以直接 @我 打出来。"
-    );
+    pendingAt.set(tkey, { sender: senderOpenId, expiresAt: Date.now() + 90 * 1000 });
+    if (pendingAt.size > 500) pendingAt.clear();
+    await replyTo(msg.message_id, "好的，把要翻译的视频发上来就行～（90 秒内发都算，不用再 @我）");
     return;
   }
+
+  // 有文字意见 → 润色成可发红人的话（.env 设 FEEDBACK_POLISH=off 可关闭，关了就直接忽略）
+  if (!POLISH_ON) return;
   try {
     const out = await withRetry(() => polishFeedback(text, threadVideoLang.get(tkey)), { label: "润色" });
     const target = threadVideoSender.get(tkey); // 这个话题里发视频的人
