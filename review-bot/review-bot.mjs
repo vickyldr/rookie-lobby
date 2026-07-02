@@ -511,7 +511,8 @@ async function handleMessage(data) {
   let fileKey = selfFileKey;
   let mediaMsgId = msg.message_id; // 视频所在消息的 id（下载资源要用它）
   let videoSenderOpenId = senderOpenId; // 默认记发 @ 的人
-  if (!fileKey && !text && mentionsBot) {
+  // 关了润色时：@带的任何文字都不当反馈，只要能找到视频就翻（如"翻译一下这个视频"）
+  if (!fileKey && mentionsBot && (!POLISH_ON || !text)) {
     try {
       const src = await findRecentVideoMessage(msg);
       if (src) {
@@ -586,25 +587,23 @@ async function handleMessage(data) {
   }
 
   // 到这里 = 没有视频可翻。
-  // 纯 @（没视频、没意见）→ 登记"等视频"：接下来 90 秒内同一个人发的视频自动认下（支持"先 @ 后发视频"）
-  if (!text) {
-    // 安静登记"等视频"，不回任何话（避免刷屏）；90 秒内同一个人发的视频自动认下
-    pendingAt.set(tkey, { sender: senderOpenId, expiresAt: Date.now() + 90 * 1000 });
-    if (pendingAt.size > 500) pendingAt.clear();
+  // 开启润色 且 有文字意见 → 润色成可发红人的话
+  if (POLISH_ON && text) {
+    try {
+      const out = await withRetry(() => polishFeedback(text, threadVideoLang.get(tkey)), { label: "润色" });
+      const target = threadVideoSender.get(tkey); // 这个话题里发视频的人
+      const at = target && target.openId ? `<at user_id="${target.openId}"></at> ` : "";
+      await replyTo(msg.message_id, `${at}✍️ 可直接发给红人：\n\n${out}`);
+    } catch (e) {
+      console.error("polish error:", e);
+      await replyTo(msg.message_id, isRateLimit(e) ? BUSY_MSG : "润色出错了，稍后再试。");
+    }
     return;
   }
 
-  // 有文字意见 → 润色成可发红人的话（.env 设 FEEDBACK_POLISH=off 可关闭，关了就直接忽略）
-  if (!POLISH_ON) return;
-  try {
-    const out = await withRetry(() => polishFeedback(text, threadVideoLang.get(tkey)), { label: "润色" });
-    const target = threadVideoSender.get(tkey); // 这个话题里发视频的人
-    const at = target && target.openId ? `<at user_id="${target.openId}"></at> ` : "";
-    await replyTo(msg.message_id, `${at}✍️ 可直接发给红人：\n\n${out}`);
-  } catch (e) {
-    console.error("polish error:", e);
-    await replyTo(msg.message_id, isRateLimit(e) ? BUSY_MSG : "润色出错了，稍后再试。");
-  }
+  // 其他（纯 @；或关了润色时 @所带的任何文字）→ 安静登记"等视频"，90 秒内同一人发的视频自动认下
+  pendingAt.set(tkey, { sender: senderOpenId, expiresAt: Date.now() + 90 * 1000 });
+  if (pendingAt.size > 500) pendingAt.clear();
 }
 
 const eventDispatcher = new Lark.EventDispatcher({}).register({
