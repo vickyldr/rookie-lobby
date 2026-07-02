@@ -177,7 +177,18 @@ async function listThreadMessages(threadId) {
   if (!res.ok) throw new Error(`列话题消息失败 ${res.status}: ` + JSON.stringify(j).slice(0, 120));
   return j?.data?.items || [];
 }
-// 找"这次 @ 想翻译的视频"：① 被回复的那条 → ② 话题里最近的一条视频 → ③ 话题根消息
+// 列出群(chat)里最近的消息（按时间倒序），用来在平铺群里找最近一条视频
+async function listChatMessages(chatId) {
+  const token = await tenantToken();
+  const url =
+    `${OPEN_BASE}/open-apis/im/v1/messages?container_id_type=chat` +
+    `&container_id=${encodeURIComponent(chatId)}&sort_type=ByCreateTimeDesc&page_size=20`;
+  const res = await fetch(url, { headers: { authorization: `Bearer ${token}` } });
+  const j = await res.json();
+  if (!res.ok) throw new Error(`列群消息失败 ${res.status}: ` + JSON.stringify(j).slice(0, 120));
+  return j?.data?.items || [];
+}
+// 找"这次 @ 想翻译的视频"：① 被回复的那条 → ② 话题里最近的视频 → ③ 话题根 → ④ 平铺群里最近的视频
 async function findRecentVideoMessage(msg) {
   if (msg.parent_id) {
     const p = await getMessage(msg.parent_id).catch(() => null);
@@ -193,6 +204,18 @@ async function findRecentVideoMessage(msg) {
   if (msg.root_id) {
     const r = await getMessage(msg.root_id).catch(() => null);
     if (r && fileKeyFromMessage(r.msg_type, r.body?.content)) return r;
+  }
+  // 平铺群：视频和 @ 是两条独立消息，靠翻最近群消息找最近一条视频（限 @ 之前、30 分钟内）
+  if (msg.chat_id) {
+    const items = await listChatMessages(msg.chat_id).catch(() => []); // 倒序，最新在前
+    const atTime = Number(msg.create_time) || 0;
+    for (const m of items) {
+      if (m.message_id === msg.message_id) continue;
+      if (!fileKeyFromMessage(m.msg_type, m.body?.content)) continue;
+      const t = Number(m.create_time) || 0;
+      if (atTime && t && atTime - t > 30 * 60 * 1000) break; // 太久以前的不认，避免抓错
+      return m;
+    }
   }
   return null;
 }
