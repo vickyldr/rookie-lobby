@@ -228,15 +228,91 @@ async function polishFeedback(rough, lang) {
     "6) 只输出可直接发送的正文，不要解释、不要加引号、不要附中文原文。";
   return llmChat(sys, rough);
 }
-// 基于视频译文，给审稿同学几条可参考的修改建议（内部看的，中文）
-async function suggestEdits(zhTranslation) {
+// 带图片的 LLM 调用（gpt-4o-mini 多模态）：把若干帧当图片一起喂进去
+async function llmVision(system, textUser, frames, maxTokens = 800) {
+  const content = [{ type: "text", text: textUser }];
+  for (const f of frames) content.push({ type: "image_url", image_url: { url: f.dataUrl, detail: "low" } });
+  const res = await fetch(RELAY_URL, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(isAzure(RELAY_URL) ? { "api-key": RELAY_KEY } : { authorization: `Bearer ${RELAY_KEY}` }),
+    },
+    body: JSON.stringify({
+      model: RELAY_MODEL,
+      max_tokens: maxTokens,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content },
+      ],
+    }),
+  });
+  if (!res.ok) {
+    const body = (await res.text()).slice(0, 160);
+    if (res.status === 429) throw new RateLimitError(`视觉限流 429: ${body}`);
+    throw new Error(`视觉 ${res.status}: ${body}`);
+  }
+  const j = await res.json();
+  return (j.choices?.[0]?.message?.content ?? "").trim();
+}
+
+// 用 ffprobe 读视频时长（秒）
+function videoDuration(videoPath) {
+  return new Promise((resolve, reject) => {
+    const p = spawn("ffprobe", [
+      "-v", "error", "-show_entries", "format=duration",
+      "-of", "default=noprint_wrappers=1:nokey=1", videoPath,
+    ]);
+    let out = "", err = "";
+    p.stdout.on("data", (d) => (out += d));
+    p.stderr.on("data", (d) => (err += d));
+    p.on("error", (e) => reject(e));
+    p.on("close", (code) => (code === 0 ? resolve(parseFloat(out.trim()) || 0) : reject(new Error(err.slice(-120)))));
+  });
+}
+
+// ffmpeg 抽帧：每秒 1 帧、缩到 512 宽；再"开头密后面疏"地挑，最多 30 张
+function extractFrames(videoPath, outDir) {
+  return new Promise((resolve, reject) => {
+    fs.mkdirSync(outDir, { recursive: true });
+    const p = spawn("ffmpeg", ["-y", "-i", videoPath, "-vf", "fps=1,scale=512:-2", path.join(outDir, "f_%03d.jpg")]);
+    let err = "";
+    p.stderr.on("data", (d) => (err += d));
+    p.on("error", (e) => reject(new Error("ffmpeg 抽帧失败? " + e.message)));
+    p.on("close", (code) => {
+      if (code !== 0) return reject(new Error("抽帧失败: " + err.slice(-160)));
+      const files = fs.readdirSync(outDir).filter((f) => f.endsWith(".jpg")).sort();
+      // 前 15 秒每帧都留，之后隔一帧取一张（约每 2 秒），最后封顶 30 张
+      const picked = files.filter((_, i) => i < 15 || (i - 15) % 2 === 0).slice(0, 30);
+      const frames = picked.map((f) => {
+        const idx = parseInt((f.match(/(\d+)/) || [0, "1"])[1], 10); // f_001 = 第 1 帧
+        const b64 = fs.readFileSync(path.join(outDir, f)).toString("base64");
+        return { t: idx - 1, dataUrl: `data:image/jpeg;base64,${b64}` }; // t≈第几秒
+      });
+      resolve(frames);
+    });
+  });
+}
+
+// 审稿清单：看画面帧 + 口播译文，按 KOL 基础 SOP 逐项检查（内部参考，中文）
+async function reviewChecklist(zhTranscript, frames, durationSec) {
+  const times = frames.map((f) => `${f.t}s`).join("、");
   const sys =
-    "你是资深短视频审稿人，在帮 KOL 运营看红人视频稿。下面是这条视频的中文翻译（带时间戳）。" +
-    "基于内容给出 2–4 条【可以考虑的修改建议】，供审稿同学参考：" +
-    "聚焦开头钩子、节奏、卖点是否清晰、行动号召(CTA)、时长、口播是否啰嗦等，能指到具体时间点就指；" +
-    "每条一句话、具体可操作、用中文。若视频已经不错、没什么明显可改的，只回复：暂无明显可改点。" +
-    "只输出建议本身，不要复述翻译、不要客套。";
-  return llmChat(sys, zhTranslation, 600);
+    "你是 KOL 短视频审稿助手。下面给你一条红人视频的【口播中文译文】和【按时间抽取的画面帧】。" +
+    "严格按下面清单逐项检查，每项给 ✅ 通过 或 ⚠️ 需注意 + 一句简短说明（能指到第几秒就指）。" +
+    "只看这些基础项，不要评价运镜/转场/剪辑节奏/打光/审美：\n" +
+    `1) 时长：是否 ≤60 秒（本视频约 ${Math.round(durationSec)} 秒）；\n` +
+    "2) Logo：画面里有没有品牌 logo？大小是否合适（别太小看不清，也别大到喧宾夺主）？大概第几秒出现；\n" +
+    "3) 标题字幕：有没有标题/字幕文字；\n" +
+    "4) App 录屏操作：有没有 app 内操作的录屏画面？是否清晰、看得懂在操作什么（结合口播判断）；\n" +
+    "5) 产品效果展示：产品效果/使用效果露出是否足够多；\n" +
+    "6) 开头/Hook：从开头到『首次出现产品名/logo/产品效果』这段算开头，是否太长（越短越好）？指出产品/logo 大概第几秒才出现；\n" +
+    "7) 口播：有没有口播、讲解是否清楚；\n" +
+    "某项若从画面/口播无法判断，就写『无法判断』。\n" +
+    `画面帧依次对应时间点：${times}。\n` +
+    "用中文、简洁，每项一行；只输出清单本身，不要开场白、不要结尾总结。";
+  const user = "【口播中文译文】\n" + (zhTranscript || "（无口播 / 未识别到语音）");
+  return llmVision(sys, user, frames, 800);
 }
 
 // ---- de-dupe ----
@@ -343,29 +419,34 @@ async function handleMessage(data) {
     enqueue(async () => {
       const vid = path.join(os.tmpdir(), msg.message_id + ".mp4");
       const aud = path.join(os.tmpdir(), msg.message_id + ".wav");
+      const frameDir = path.join(os.tmpdir(), msg.message_id + "_frames");
       try {
         await downloadMedia(mediaMsgId, fileKey, vid);
         await extractAudio(vid, aud);
         const tr = await withRetry(() => transcribe(aud), { label: "whisper" });
         const segs = tr.segments || [];
-        if (!segs.length) {
-          await replyTo(msg.message_id, "这条视频没听出语音（可能是纯音乐/无人声）。");
-          return;
-        }
         if (tr.language) threadVideoLang.set(tkey, tr.language); // 记住红人语言，润色反馈时用
-        const zh = await withRetry(() => translateSegments(segs), { label: "翻译" });
-        // 顺带给审稿同学几条参考建议（best-effort，失败也不影响翻译）
-        let suggestBlock = "";
-        try {
-          const sug = await withRetry(() => suggestEdits(zh), { label: "建议" });
-          if (sug && !/^暂无/.test(sug.trim()))
-            suggestBlock =
-              `\n\n💡 AI 审稿建议（⚠️ 由 AI 自动生成、仅供参考，最终以 TL 意见为准；红人看不到）：\n` +
-              `${sug.trim()}\n——以上为 AI 参考，请以 TL 实际意见为准。`;
-        } catch (e) {
-          console.error("suggest error:", String(e.message || e).slice(0, 120));
+
+        // 第 1 条：先发翻译（快），让审稿同学马上能看
+        let zh = "";
+        if (segs.length) {
+          zh = await withRetry(() => translateSegments(segs), { label: "翻译" });
+          await replyTo(msg.message_id, `📝 视频翻译（语言：${tr.language || "?"}）\n\n${zh}`);
+        } else {
+          await replyTo(msg.message_id, "这条视频没听出语音（可能是纯音乐/无人声），仅做画面审稿。");
         }
-        await replyTo(msg.message_id, `📝 视频翻译（语言：${tr.language || "?"}）\n\n${zh}${suggestBlock}`);
+
+        // 第 2 条：审稿清单（看画面帧+口播，较慢；best-effort，失败也不影响上面的翻译）
+        try {
+          const dur = await videoDuration(vid).catch(() => 0);
+          const frames = await extractFrames(vid, frameDir);
+          if (frames.length) {
+            const cl = await withRetry(() => reviewChecklist(zh, frames, dur), { label: "审稿" });
+            if (cl) await replyTo(msg.message_id, `🔍 AI 自动审稿清单（⚠️ AI 生成、仅供参考，以 TL 为准）\n${cl.trim()}`);
+          }
+        } catch (e) {
+          console.error("checklist error:", String(e.message || e).slice(0, 140));
+        }
       } catch (e) {
         console.error("video error:", e);
         await replyTo(
@@ -376,6 +457,7 @@ async function handleMessage(data) {
         videoQueueLen--;
         fs.unlink(vid, () => {});
         fs.unlink(aud, () => {});
+        fs.rm(frameDir, { recursive: true, force: true }, () => {});
       }
     });
     return;
