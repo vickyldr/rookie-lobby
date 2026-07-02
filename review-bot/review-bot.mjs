@@ -190,33 +190,49 @@ async function listChatMessages(chatId) {
 }
 // 找"这次 @ 想翻译的视频"：① 被回复的那条 → ② 话题里最近的视频 → ③ 话题根 → ④ 平铺群里最近的视频
 async function findRecentVideoMessage(msg) {
+  console.log(
+    `[find] parent=${msg.parent_id || "-"} thread=${msg.thread_id || "-"} root=${msg.root_id || "-"} chat=${msg.chat_id || "-"}`
+  );
   if (msg.parent_id) {
-    const p = await getMessage(msg.parent_id).catch(() => null);
-    if (p && fileKeyFromMessage(p.msg_type, p.body?.content)) return p;
+    const p = await getMessage(msg.parent_id).catch((e) => {
+      console.log("[find] parent 取失败:", String(e.message || e).slice(0, 100));
+      return null;
+    });
+    if (p && fileKeyFromMessage(p.msg_type, p.body?.content)) return console.log("[find] 命中 parent"), p;
   }
   if (msg.thread_id) {
-    const items = await listThreadMessages(msg.thread_id).catch(() => []);
-    const vids = items.filter(
-      (m) => m.message_id !== msg.message_id && fileKeyFromMessage(m.msg_type, m.body?.content)
-    );
-    if (vids.length) return vids[vids.length - 1]; // 多轮改稿时取最近的一条视频
+    const items = await listThreadMessages(msg.thread_id).catch((e) => {
+      console.log("[find] thread 列表失败:", String(e.message || e).slice(0, 100));
+      return [];
+    });
+    console.log(`[find] thread 列到 ${items.length} 条`);
+    const vids = items.filter((m) => m.message_id !== msg.message_id && fileKeyFromMessage(m.msg_type, m.body?.content));
+    if (vids.length) return console.log("[find] 命中 thread 视频"), vids[vids.length - 1];
   }
   if (msg.root_id) {
-    const r = await getMessage(msg.root_id).catch(() => null);
-    if (r && fileKeyFromMessage(r.msg_type, r.body?.content)) return r;
+    const r = await getMessage(msg.root_id).catch((e) => {
+      console.log("[find] root 取失败:", String(e.message || e).slice(0, 100));
+      return null;
+    });
+    if (r && fileKeyFromMessage(r.msg_type, r.body?.content)) return console.log("[find] 命中 root"), r;
   }
   // 平铺群：视频和 @ 是两条独立消息，靠翻最近群消息找最近一条视频（限 @ 之前、30 分钟内）
   if (msg.chat_id) {
-    const items = await listChatMessages(msg.chat_id).catch(() => []); // 倒序，最新在前
+    const items = await listChatMessages(msg.chat_id).catch((e) => {
+      console.log("[find] chat 列表失败:", String(e.message || e).slice(0, 100));
+      return [];
+    });
+    console.log(`[find] chat 列到 ${items.length} 条`);
     const atTime = Number(msg.create_time) || 0;
     for (const m of items) {
       if (m.message_id === msg.message_id) continue;
       if (!fileKeyFromMessage(m.msg_type, m.body?.content)) continue;
       const t = Number(m.create_time) || 0;
       if (atTime && t && atTime - t > 30 * 60 * 1000) break; // 太久以前的不认，避免抓错
-      return m;
+      return console.log("[find] 命中 chat 视频"), m;
     }
   }
+  console.log("[find] 没找到视频");
   return null;
 }
 
@@ -437,7 +453,8 @@ async function handleMessage(data) {
   const msg = data?.message;
   if (!msg || !once(msg.message_id)) return;
   console.log(
-    `[msg] type=${msg.message_type} chat=${msg.chat_type} mentions=${(msg.mentions || []).length} content=${(msg.content || "").slice(0, 120)}`
+    `[msg] type=${msg.message_type} chat=${msg.chat_type} mentions=${(msg.mentions || []).length}` +
+      ` thread=${msg.thread_id || "-"} root=${msg.root_id || "-"} parent=${msg.parent_id || "-"} content=${(msg.content || "").slice(0, 80)}`
   );
   // 群里只在被 @ 时响应；私聊直接响应
   const mentioned = Array.isArray(msg.mentions) && msg.mentions.length > 0;
