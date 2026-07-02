@@ -34,6 +34,12 @@ const OPEN_BASE = FEISHU_DOMAIN === "lark" ? "https://open.larksuite.com" : "htt
 const TRANSCRIBE_URL = WHISPER_URL || RELAY_URL.replace(/\/chat\/completions.*$/, "/audio/transcriptions");
 // Azure OpenAI 用 `api-key` 请求头（不是标准 OpenAI 的 Bearer），且模型名在 URL 里而非 body
 const isAzure = (u) => /\.azure\.com/i.test(u || "");
+
+// 产品说明 + "效果"长什么样：审稿看画面判断"产品效果展示/开头 hook"时用来对照。
+// 按你们实际产品改这一句即可，也可以在 .env 里设 PRODUCT_INFO 覆盖。
+const PRODUCT_INFO =
+  process.env.PRODUCT_INFO ||
+  "产品是 Riffmix（把照片/素材自动生成带歌音乐视频的 App）。“产品效果”指画面里展示用该 App 做出来的成品：生成好的音乐视频在播放、最终作品展示、或前后对比。";
 const domain = FEISHU_DOMAIN === "lark" ? Lark.Domain.Lark : Lark.Domain.Feishu;
 const client = new Lark.Client({ appId: FEISHU_APP_ID, appSecret: FEISHU_APP_SECRET, domain });
 const wsClient = new Lark.WSClient({ appId: FEISHU_APP_ID, appSecret: FEISHU_APP_SECRET, domain });
@@ -298,15 +304,16 @@ function extractFrames(videoPath, outDir) {
 async function reviewChecklist(zhTranscript, frames, durationSec) {
   const times = frames.map((f) => `${f.t}s`).join("、");
   const sys =
-    "你是 KOL 短视频审稿助手。下面给你一条红人视频的【口播中文译文】和【按时间抽取的画面帧】。" +
+    "你是 KOL 短视频审稿助手。" + PRODUCT_INFO + "\n" +
+    "下面给你一条红人视频的【口播中文译文】和【按时间抽取的画面帧】。" +
     "严格按下面清单逐项检查，每项给 ✅ 通过 或 ⚠️ 需注意 + 一句简短说明（能指到第几秒就指）。" +
     "只看这些基础项，不要评价运镜/转场/剪辑节奏/打光/审美：\n" +
     `1) 时长：是否 ≤60 秒（本视频约 ${Math.round(durationSec)} 秒）；\n` +
     "2) Logo：画面里有没有品牌 logo？大小是否合适（别太小看不清，也别大到喧宾夺主）？大概第几秒出现；\n" +
-    "3) 标题字幕：有没有标题/字幕文字；\n" +
+    "3) 标题字幕：画面里有没有标题文字？把标题原文读出来、翻成中文，再简短点评（有没有点明卖点、够不够吸引人）；若没标题就标 ⚠️ 提示加标题；\n" +
     "4) App 录屏操作：有没有 app 内操作的录屏画面？是否清晰、看得懂在操作什么（结合口播判断）；\n" +
-    "5) 产品效果展示：产品效果/使用效果露出是否足够多；\n" +
-    "6) 开头/Hook：从开头到『首次出现产品名/logo/产品效果』这段算开头，是否太长（越短越好）？指出产品/logo 大概第几秒才出现；\n" +
+    "5) 产品效果展示：按标准，开头和结尾最好【各有一次】产品效果露出——分别检查开头、结尾有没有，各在大概第几秒；缺哪头就明确指出；\n" +
+    "6) 开头/Hook：从视频开头，到『产品名 / logo / 产品效果 这三者里最早出现的那一个』为止算开头，是否太长（越短越好）？指出最早出现的是哪一样、在第几秒（效果先出现也算，不一定非要产品名）；\n" +
     "7) 口播：有没有口播、讲解是否清楚；\n" +
     "某项若从画面/口播无法判断，就写『无法判断』。\n" +
     `画面帧依次对应时间点：${times}。\n` +
