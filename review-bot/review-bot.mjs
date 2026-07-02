@@ -35,11 +35,20 @@ const TRANSCRIBE_URL = WHISPER_URL || RELAY_URL.replace(/\/chat\/completions.*$/
 // Azure OpenAI 用 `api-key` 请求头（不是标准 OpenAI 的 Bearer），且模型名在 URL 里而非 body
 const isAzure = (u) => /\.azure\.com/i.test(u || "");
 
-// 产品说明 + "效果"长什么样：审稿看画面判断"产品效果展示/开头 hook"时用来对照。
-// 按你们实际产品改这一句即可，也可以在 .env 里设 PRODUCT_INFO 覆盖。
+// 旗下多个 AI App，红人视频可能推广其中任意一个；每个产品的"效果"(画面该展示的成品)不同。
+// 审稿时先认出是哪个产品，再按对应"效果"判。加新产品就往这个列表里加一行；也可用 .env 的 PRODUCT_INFO 覆盖。
 const PRODUCT_INFO =
   process.env.PRODUCT_INFO ||
-  "产品是一款 AI 创作 App（Riffmix，用 AI 自动生成视频、歌曲/音乐）。“产品效果”指画面里展示 AI 生成的成品——AI 做出来的视频在播放、AI 生成的歌曲/音乐、AI 特效呈现、或用 App 做出来的最终作品。";
+  [
+    "我们旗下有多个 AI App，这条红人视频可能在推广其中某一个。各产品及其“产品效果”（画面里应展示的成品）如下：",
+    "· VivaVideo：AI 剪辑工具（AI 视觉功能大集合：AI 玩法模板、文生图、文生视频、数字人等）。效果=展示这些 AI 功能做出的成品画面。",
+    "· AICatch：AI 玩法模板（各种 AI 图片/视频模板）。效果=用模板生成的 AI 图片/视频成品。",
+    "· Rythmix：AI 音乐（AI 歌曲、AI 音乐视频）。效果=生成的 AI 歌曲在播放 / AI 音乐视频成品。",
+    "· Wisemeal：AI 卡路里。效果=画面在计算食物卡路里、并给出饮食建议。",
+    "· Rymo：AI 音乐视频。效果=生成的 AI 音乐视频成品。",
+    "· Recco：AI 笔记（类似 AI 聊天）。效果=展示 AI 生成的文字回答/笔记。",
+    "· Inspo：集合 AICatch、Rythmix、VivaVideo 的产品。效果=上述任一类 AI 成品。",
+  ].join("\n");
 const domain = FEISHU_DOMAIN === "lark" ? Lark.Domain.Lark : Lark.Domain.Feishu;
 const client = new Lark.Client({ appId: FEISHU_APP_ID, appSecret: FEISHU_APP_SECRET, domain });
 const wsClient = new Lark.WSClient({ appId: FEISHU_APP_ID, appSecret: FEISHU_APP_SECRET, domain });
@@ -335,6 +344,8 @@ async function reviewChecklist(zhTranscript, frames, durationSec) {
   const times = frames.map((f) => `${f.t}s`).join("、");
   const sys =
     "你是 KOL 短视频审稿助手。" + PRODUCT_INFO + "\n" +
+    "先从画面（logo / App 名 / 内容）判断这条视频推广的是上面哪个产品，第 5、6 项按【该产品】的效果来审；" +
+    "若认不出是哪个产品，就写『不确定是哪个产品，请自行判断』，别硬套。\n" +
     "下面给你一条红人视频的【口播中文译文】和【按时间抽取的画面帧】。" +
     "严格按下面清单逐项检查，每项给 ✅ 通过 或 ⚠️ 需注意 + 一句简短说明（能指到第几秒就指）。" +
     "只看这些基础项，不要评价运镜/转场/剪辑节奏/打光/审美：\n" +
