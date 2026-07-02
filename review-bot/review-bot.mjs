@@ -358,7 +358,10 @@ async function handleMessage(data) {
         let suggestBlock = "";
         try {
           const sug = await withRetry(() => suggestEdits(zh), { label: "建议" });
-          if (sug && !/^暂无/.test(sug.trim())) suggestBlock = `\n\n💡 审稿建议（仅供参考，红人看不到）：\n${sug.trim()}`;
+          if (sug && !/^暂无/.test(sug.trim()))
+            suggestBlock =
+              `\n\n💡 AI 审稿建议（⚠️ 由 AI 自动生成、仅供参考，最终以 TL 意见为准；红人看不到）：\n` +
+              `${sug.trim()}\n——以上为 AI 参考，请以 TL 实际意见为准。`;
         } catch (e) {
           console.error("suggest error:", String(e.message || e).slice(0, 120));
         }
