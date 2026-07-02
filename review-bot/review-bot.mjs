@@ -49,6 +49,9 @@ const PRODUCT_INFO =
     "· Recco：AI 笔记（类似 AI 聊天）。效果=展示 AI 生成的文字回答/笔记。",
     "· Inspo：集合 AICatch、Rythmix、VivaVideo 的产品。效果=上述任一类 AI 成品。",
   ].join("\n");
+
+// 是否开启"把修改意见润色成发给红人的话"功能。.env 里设 FEEDBACK_POLISH=off 可关掉，只保留视频翻译。
+const POLISH_ON = String(process.env.FEEDBACK_POLISH ?? "on").toLowerCase() !== "off";
 const domain = FEISHU_DOMAIN === "lark" ? Lark.Domain.Lark : Lark.Domain.Feishu;
 const client = new Lark.Client({ appId: FEISHU_APP_ID, appSecret: FEISHU_APP_SECRET, domain });
 const wsClient = new Lark.WSClient({ appId: FEISHU_APP_ID, appSecret: FEISHU_APP_SECRET, domain });
@@ -549,6 +552,13 @@ async function handleMessage(data) {
       }
     });
     return;
+  }
+
+  // 反馈润色（可用 .env 的 FEEDBACK_POLISH=off 关掉；关掉后只做视频翻译）
+  if (!POLISH_ON) {
+    if (!text)
+      await replyTo(msg.message_id, "没找到要翻译的视频～把视频和 @我 发在同一条，或在同一个话题里 @我。");
+    return; // 已关闭反馈润色：即使写了意见也不处理
   }
 
   // 文字（text 或 post 里的纯文字）= 修改意见 → 润色 + @回发视频的同学
