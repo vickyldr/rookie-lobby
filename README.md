@@ -6,6 +6,10 @@
 - **长连接模式**：机器人主动连飞书，**不需要公网域名 / HTTPS / 服务器备案**，VPS 甚至自己电脑上 `node` 跑起来就行。
 - **文档只维护一份**：你在飞书里改 SOP，机器人自动同步读到最新——**不用维护第二份**。
 
+> **📦 本仓库有两个独立机器人**（各用各的飞书应用、各自 `.env`、互不影响）：
+> 1. **带教/答疑机器人** — 仓库根目录（`server.js` 等），**本 README 主要讲它**；飞书群 @它答新人问题。
+> 2. **翻译/审稿机器人** — [`review-bot/`](review-bot/) 目录；KOL 审稿群 @它发视频，返回带时间戳中文翻译。**说明见文末「翻译/审稿机器人」一节**。
+
 ---
 
 ## 0. 你需要准备的三样东西
@@ -144,6 +148,31 @@ pm2 save
 
 ---
 
+## 翻译/审稿机器人（review-bot/）
+
+和带教 bot **完全独立**，用**另一个**飞书自建应用，代码在 [`review-bot/`](review-bot/) 目录。
+
+**能做什么**：KOL 审稿群里 **@它 + 一条视频**（视频和 @ 同一条 / 回复视频再 @ / 同一话题里另发一条 @）→ 自动 **抽音频（ffmpeg）→ whisper 转写 → gpt-4o-mini 翻译** → 回一条带时间戳的中文翻译。
+
+**可选功能（`.env` 开关，默认开）**：
+- `FEEDBACK_POLISH=off` 关掉「把中文修改意见润色成可直接发红人的话」。
+- `REVIEW_CHECKLIST=off` 关掉「翻译后附一条 AI 审稿清单」（看画面帧判断 logo / 标题字幕 / 产品效果 / hook 时长等，⚠️ 仅供参考、以 TL 为准）。
+
+**AI 接口**：OpenAI 兼容，支持标准中转和 **Azure OpenAI**（URL 含 `azure.com` 时自动改用 `api-key` 请求头）。
+
+**跑法**（VPS 需装 `ffmpeg`）：
+
+```bash
+cd review-bot
+npm install
+cp .env.example .env    # 填另一个飞书应用凭证 + AI 接口，详见 review-bot/.env.example
+pm2 start review-bot.mjs --name review-bot
+```
+
+**飞书权限**：`im:message`、`im:resource`、`im:message:send_as_bot`、`im:message.group_at_msg:readonly`、`im:message.p2p_msg:readonly`；要「话题/群里另发一条 @ 也能找到视频」还需 `im:message.group_msg`（获取群组中所有消息，敏感权限）。事件同样订阅 `im.message.receive_v1`（长连接）。
+
+---
+
 ## 文件一览
 
 | 文件 | 作用 |
@@ -153,5 +182,7 @@ pm2 save
 | `knowledge.md` | 手写的固定知识（入职流程、工具用法、答疑口径） |
 | `.env.example` | 配置模板，复制成 `.env` 填 |
 | `.gitignore` | 挡掉 `.env`、`node_modules`、同步缓存——**别把密钥提交上来** |
+| `digest.mjs` `approve.mjs` `todo.mjs` | 带教 bot 的辅助脚本（自学习提炼、审核入库、待办/日报） |
+| `review-bot/` | **翻译/审稿机器人**（独立的第二个 bot，见上一节） |
 
 > ⚠️ **千万别把 `.env` 提交进 git**（里面有密钥）。`.gitignore` 已经挡掉了，照着用就行。
