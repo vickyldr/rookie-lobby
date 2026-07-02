@@ -588,9 +588,9 @@ async function handleMessage(data) {
   // 到这里 = 没有视频可翻。
   // 纯 @（没视频、没意见）→ 登记"等视频"：接下来 90 秒内同一个人发的视频自动认下（支持"先 @ 后发视频"）
   if (!text) {
+    // 安静登记"等视频"，不回任何话（避免刷屏）；90 秒内同一个人发的视频自动认下
     pendingAt.set(tkey, { sender: senderOpenId, expiresAt: Date.now() + 90 * 1000 });
     if (pendingAt.size > 500) pendingAt.clear();
-    await replyTo(msg.message_id, "好的，把要翻译的视频发上来就行～（90 秒内发都算，不用再 @我）");
     return;
   }
 
