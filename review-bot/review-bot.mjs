@@ -153,6 +153,16 @@ async function tenantToken() {
   _tok = { v: j.tenant_access_token, exp: Date.now() + Math.max(60, (j.expire || 7200) - 60) * 1000 };
   return _tok.v;
 }
+// 取机器人自己的 open_id（用来判断"是不是 @了机器人本人"，而不是 @了任意人）
+let _botOpenId = "";
+async function botOpenId() {
+  if (_botOpenId) return _botOpenId;
+  const token = await tenantToken();
+  const res = await fetch(`${OPEN_BASE}/open-apis/bot/v3/info`, { headers: { authorization: `Bearer ${token}` } });
+  const j = await res.json();
+  _botOpenId = j?.bot?.open_id || "";
+  return _botOpenId;
+}
 async function downloadMedia(messageId, fileKey, destPath) {
   const token = await tenantToken();
   const url = `${OPEN_BASE}/open-apis/im/v1/messages/${messageId}/resources/${fileKey}?type=file`;
@@ -461,9 +471,15 @@ async function handleMessage(data) {
     `[msg] type=${msg.message_type} chat=${msg.chat_type} mentions=${(msg.mentions || []).length}` +
       ` thread=${msg.thread_id || "-"} root=${msg.root_id || "-"} parent=${msg.parent_id || "-"} content=${(msg.content || "").slice(0, 80)}`
   );
-  // 群里只在被 @ 时响应；私聊直接响应
-  const mentioned = Array.isArray(msg.mentions) && msg.mentions.length > 0;
-  if (msg.chat_type === "group" && !mentioned) return;
+  // 群里【只在 @了机器人本人】时响应（不是 @了任意人就响应）；私聊直接响应
+  const botId = _botOpenId; // 启动时已取到
+  const mentionsBot =
+    Array.isArray(msg.mentions) &&
+    msg.mentions.some((m) => {
+      const oid = m?.id?.open_id || (typeof m?.id === "string" ? m.id : "");
+      return botId ? oid === botId : true; // 万一没取到 botId，退回"有@就算"，避免完全不响应
+    });
+  if (msg.chat_type === "group" && !mentionsBot) return;
   const senderOpenId = data.sender?.sender_id?.open_id;
   const tkey = threadKeyOf(msg);
 
@@ -595,4 +611,8 @@ wsClient.start({ eventDispatcher });
 console.log(
   `review-bot 已启动（长连接）domain=${FEISHU_DOMAIN} 翻译模型=${WHISPER_MODEL}+${RELAY_MODEL} 转写接口=${TRANSCRIBE_URL}`
 );
+// 启动就取机器人自己的 open_id，之后严格判断"是否 @了机器人本人"
+botOpenId()
+  .then((id) => console.log(`bot open_id = ${id || "(未取到，暂退回'有@就算')"}`))
+  .catch((e) => console.error("取 bot open_id 失败:", String(e.message || e).slice(0, 120)));
 http.createServer((_req, res) => res.end("ok")).listen(process.env.PORT || 3100);
