@@ -55,6 +55,8 @@ async function replyTo(messageId, text) {
 
 // 记住每个话题里"最初发视频的同学"，TL 给意见时好 @ 回他
 const threadVideoSender = new Map(); // threadKey -> { openId, ts }
+// 记住每个话题里视频的语言（whisper 识别的），润色反馈时用红人的语言输出
+const threadVideoLang = new Map(); // threadKey -> language string，如 "german"/"spanish"
 const threadKeyOf = (msg) => msg.thread_id || msg.root_id || msg.parent_id || msg.chat_id;
 
 // ---- 限流保护：串行队列 + 自动重试 ----
@@ -214,12 +216,27 @@ async function translateSegments(segments) {
     "4) 只输出带时间戳的译文，每段一行，不要任何额外解释。";
   return llmChat(sys, src, 2000);
 }
-async function polishFeedback(rough) {
+async function polishFeedback(rough, lang) {
+  const target = lang ? `红人的语言（${lang}）` : "英文";
   const sys =
-    "你帮 KOL 运营，把给红人的粗略修改意见润色成【可以直接复制发给海外红人】的一段话：" +
-    "礼貌、专业、清晰，能分点就分点，默认用英文（若意见里明显指定了别的语言就用那个）。" +
-    "只输出可直接发送的正文，不要解释、不要加引号。";
+    "你帮 KOL 运营，把审稿同学写的粗略修改意见，整理成【可以直接复制发给红人】的一段话。要求：\n" +
+    `1) 用${target}输出（信息不足以判断语言时用英文）；语气礼貌、专业、清晰；\n` +
+    "2) 准确理解同学的真实意图，只传达 TA 真正想说的，不要臆造新的修改点；\n" +
+    "3) 带 [x:xx-x:xx] 时间戳的内容是【对视频某个片段的指代】，当作『在这个时间点…』来引用，不要把每条时间戳都当成一条新要求；\n" +
+    "4) 不要见换行就拆成新的一点——属于同一件事的话要合并；以同学的原意分点，别硬拆；\n" +
+    "5) 如果同学贴了红人的原话/台词做参考，理解它是背景、别当成要红人改的指令；\n" +
+    "6) 只输出可直接发送的正文，不要解释、不要加引号、不要附中文原文。";
   return llmChat(sys, rough);
+}
+// 基于视频译文，给审稿同学几条可参考的修改建议（内部看的，中文）
+async function suggestEdits(zhTranslation) {
+  const sys =
+    "你是资深短视频审稿人，在帮 KOL 运营看红人视频稿。下面是这条视频的中文翻译（带时间戳）。" +
+    "基于内容给出 2–4 条【可以考虑的修改建议】，供审稿同学参考：" +
+    "聚焦开头钩子、节奏、卖点是否清晰、行动号召(CTA)、时长、口播是否啰嗦等，能指到具体时间点就指；" +
+    "每条一句话、具体可操作、用中文。若视频已经不错、没什么明显可改的，只回复：暂无明显可改点。" +
+    "只输出建议本身，不要复述翻译、不要客套。";
+  return llmChat(sys, zhTranslation, 600);
 }
 
 // ---- de-dupe ----
@@ -335,8 +352,17 @@ async function handleMessage(data) {
           await replyTo(msg.message_id, "这条视频没听出语音（可能是纯音乐/无人声）。");
           return;
         }
+        if (tr.language) threadVideoLang.set(tkey, tr.language); // 记住红人语言，润色反馈时用
         const zh = await withRetry(() => translateSegments(segs), { label: "翻译" });
-        await replyTo(msg.message_id, `📝 视频翻译（语言：${tr.language || "?"}）\n\n${zh}`);
+        // 顺带给审稿同学几条参考建议（best-effort，失败也不影响翻译）
+        let suggestBlock = "";
+        try {
+          const sug = await withRetry(() => suggestEdits(zh), { label: "建议" });
+          if (sug && !/^暂无/.test(sug.trim())) suggestBlock = `\n\n💡 审稿建议（仅供参考，红人看不到）：\n${sug.trim()}`;
+        } catch (e) {
+          console.error("suggest error:", String(e.message || e).slice(0, 120));
+        }
+        await replyTo(msg.message_id, `📝 视频翻译（语言：${tr.language || "?"}）\n\n${zh}${suggestBlock}`);
       } catch (e) {
         console.error("video error:", e);
         await replyTo(
@@ -355,7 +381,7 @@ async function handleMessage(data) {
   // 文字（text 或 post 里的纯文字）= 修改意见 → 润色 + @回发视频的同学
   if (!text) return;
   try {
-    const out = await withRetry(() => polishFeedback(text), { label: "润色" });
+    const out = await withRetry(() => polishFeedback(text, threadVideoLang.get(tkey)), { label: "润色" });
     const target = threadVideoSender.get(tkey); // 这个话题里发视频的人
     const at = target && target.openId ? `<at user_id="${target.openId}"></at> ` : "";
     await replyTo(msg.message_id, `${at}✍️ 可直接发给红人：\n\n${out}`);
